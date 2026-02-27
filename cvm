@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # cvm — Claude VM
 # Runs 'claude --dangerously-skip-permissions -p' inside a Docker container
-# for isolated, fully autonomous task execution.
+# or VM (KVM/VirtualBox/VMware) for isolated, fully autonomous task execution.
 set -euo pipefail
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 MODEL="claude-sonnet-4-6"
+BACKEND=""          # empty = auto-detect
 DIR=""
 KEEP=false
 OUT=""
@@ -17,6 +18,13 @@ FORCE_BUILD=false
 NO_COLOR=false
 VERBOSE=false
 TASK=""
+
+# VM runtime state (used by cleanup/interrupt handlers)
+VM_PID=""           # KVM qemu PID
+VM_NAME=""          # VirtualBox task VM name
+VM_TASK_DIR=""      # VMware task directory path
+VM_PORT=""          # SSH port for VM backends
+VMWARE_PROVIDER=""  # ws, fusion, or player
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 # Initialize with color codes by default; setup_colors() clears them if needed
@@ -46,33 +54,36 @@ show_help() {
     cat <<EOF
 ${BOLD}cvm${RESET} — Claude VM v${VERSION}
 
-Run Claude Code inside a Docker sandbox for fully autonomous task execution.
+Run Claude Code inside an isolated sandbox for fully autonomous task execution.
 
 ${BOLD}USAGE${RESET}
     cvm [OPTIONS] "task description"
     echo "task" | cvm [OPTIONS]
 
 ${BOLD}OPTIONS${RESET}
-    -d, --dir DIR       Copy directory into workspace before run
-    -k, --keep          Keep workspace dir after completion
-    -m, --model MODEL   Claude model (default: ${MODEL})
-    -o, --out DIR       Copy workspace output to DIR after run
-    -b, --budget USD    Max spend in USD (e.g. 1.00)
-        --build         Force rebuild Docker image
-        --no-color      Disable ANSI colors
-    -v, --verbose       Verbose mode (shows docker build output + stream-json)
-    -h, --help          Show this help
-        --version       Show version
+    -d, --dir DIR           Copy directory into workspace before run
+    -k, --keep              Keep workspace dir after completion
+    -m, --model MODEL       Claude model (default: ${MODEL})
+    -o, --out DIR           Copy workspace output to DIR after run
+    -b, --budget USD        Max spend in USD (e.g. 1.00)
+        --backend BACKEND   Backend: docker, kvm, virtualbox, vmware (default: auto)
+        --build             Force rebuild Docker/VM image
+        --no-color          Disable ANSI colors
+    -v, --verbose           Verbose mode (stream-json output)
+    -h, --help              Show this help
+        --version           Show version
 
 ${BOLD}EXAMPLES${RESET}
     cvm "write a Python web scraper for example.com"
     cvm --dir ./src "refactor this codebase to use async/await"
     cvm --out ./results --budget 2.00 "analyze this dataset and generate charts"
+    cvm --backend kvm "write hello.txt with content 'hi'"
     echo "fix all TypeScript errors" | cvm --dir .
 
 ${BOLD}AUTH${RESET}
-    OAuth:   Run 'claude auth login' on the host first (~/.claude is mounted)
+    OAuth:   Run 'claude auth login' on the host (~/.claude/.credentials.json)
     API key: Set ANTHROPIC_API_KEY environment variable
+    VM backends copy credentials into the VM at runtime via SSH.
 EOF
 }
 
@@ -95,6 +106,9 @@ parse_args() {
             -b|--budget)
                 [[ $# -lt 2 ]] && die "--budget requires an argument"
                 BUDGET="$2"; shift 2 ;;
+            --backend)
+                [[ $# -lt 2 ]] && die "--backend requires an argument"
+                BACKEND="$2"; shift 2 ;;
             --build)
                 FORCE_BUILD=true; shift ;;
             --no-color)
@@ -129,10 +143,45 @@ parse_args() {
         echo ""
         die "No task provided. Pass a task as an argument or pipe it via stdin."
     fi
+
+    # Validate backend if explicitly specified
+    if [[ -n "$BACKEND" ]]; then
+        case "$BACKEND" in
+            docker|kvm|virtualbox|vmware) ;;
+            *) die "Unknown backend: $BACKEND (valid: docker, kvm, virtualbox, vmware)" ;;
+        esac
+    fi
 }
 
-# ── Docker check ──────────────────────────────────────────────────────────────
-check_docker() {
+# ── Backend detection ─────────────────────────────────────────────────────────
+detect_backend() {
+    if [[ -n "$BACKEND" ]]; then
+        [[ "$VERBOSE" == "true" ]] && info "Backend: $BACKEND (explicit)"
+        return 0
+    fi
+
+    # Auto-detect: try in order of preference
+    if command -v docker &>/dev/null && docker info &>/dev/null 2>&1; then
+        BACKEND="docker"
+    elif [[ -e /dev/kvm ]] && command -v qemu-system-x86_64 &>/dev/null; then
+        BACKEND="kvm"
+    elif command -v VBoxManage &>/dev/null; then
+        BACKEND="virtualbox"
+    elif command -v vmrun &>/dev/null; then
+        BACKEND="vmware"
+    else
+        die "No supported backend found. Install one of:
+  Docker:     https://docs.docker.com/get-docker/
+  KVM/QEMU:   apt install qemu-system-x86 qemu-utils cloud-image-utils
+  VirtualBox: https://www.virtualbox.org/
+  VMware:     https://www.vmware.com/"
+    fi
+
+    info "Backend: $BACKEND (auto-detected)"
+}
+
+# ── Dependency checks ─────────────────────────────────────────────────────────
+docker_check_deps() {
     if ! command -v docker &>/dev/null; then
         die "docker not found in PATH.
   On WSL: Enable WSL Integration in Docker Desktop:
@@ -143,6 +192,72 @@ check_docker() {
         die "Docker is not running or not accessible.
   Start Docker Desktop on Windows, then wait a few seconds and retry."
     fi
+}
+
+kvm_check_deps() {
+    command -v qemu-system-x86_64 &>/dev/null \
+        || die "qemu-system-x86_64 not found. Install: apt install qemu-system-x86"
+    command -v qemu-img &>/dev/null \
+        || die "qemu-img not found. Install: apt install qemu-utils"
+    [[ -e /dev/kvm ]] \
+        || die "/dev/kvm not found. Enable KVM virtualization in your BIOS/UEFI."
+    if ! command -v cloud-localds &>/dev/null \
+        && ! command -v genisoimage &>/dev/null \
+        && ! command -v mkisofs &>/dev/null; then
+        die "No ISO creation tool found. Install one of:
+  apt install cloud-image-utils   (provides cloud-localds)
+  apt install genisoimage         (provides genisoimage)"
+    fi
+}
+
+vbox_check_deps() {
+    command -v VBoxManage &>/dev/null \
+        || die "VBoxManage not found. Install VirtualBox: https://www.virtualbox.org/"
+    command -v qemu-img &>/dev/null \
+        || die "qemu-img not found (needed for image conversion). Install: apt install qemu-utils"
+    if ! command -v cloud-localds &>/dev/null \
+        && ! command -v genisoimage &>/dev/null \
+        && ! command -v mkisofs &>/dev/null; then
+        die "No ISO creation tool found. Install: apt install cloud-image-utils"
+    fi
+}
+
+vmware_check_deps() {
+    command -v vmrun &>/dev/null \
+        || die "vmrun not found. Install VMware Workstation, Player, or Fusion."
+
+    # Detect provider type by probing
+    VMWARE_PROVIDER=""
+    local provider
+    for provider in ws fusion player; do
+        if vmrun -T "$provider" list &>/dev/null 2>&1; then
+            VMWARE_PROVIDER="$provider"
+            break
+        fi
+    done
+
+    if [[ -z "$VMWARE_PROVIDER" ]]; then
+        # Fallback: detect from installed applications
+        if [[ -d "/Applications/VMware Fusion.app" ]]; then
+            VMWARE_PROVIDER="fusion"
+        elif command -v vmplayer &>/dev/null; then
+            VMWARE_PROVIDER="player"
+        else
+            VMWARE_PROVIDER="ws"
+        fi
+        warn "Could not probe VMware provider; defaulting to: $VMWARE_PROVIDER"
+    fi
+
+    [[ "$VERBOSE" == "true" ]] && info "VMware provider: $VMWARE_PROVIDER"
+}
+
+check_deps() {
+    case "$BACKEND" in
+        docker)     docker_check_deps ;;
+        kvm)        kvm_check_deps ;;
+        virtualbox) vbox_check_deps ;;
+        vmware)     vmware_check_deps ;;
+    esac
 }
 
 # ── Auth check ────────────────────────────────────────────────────────────────
@@ -164,7 +279,7 @@ check_auth() {
     fi
 }
 
-# ── Image build ───────────────────────────────────────────────────────────────
+# ── Docker image ──────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOCKERFILE="$SCRIPT_DIR/Dockerfile"
 IMAGE_HASH=""
@@ -176,7 +291,7 @@ compute_image_hash() {
     IMAGE_HASH="$(sha256sum "$DOCKERFILE" | cut -c1-12)"
 }
 
-ensure_image() {
+docker_ensure_image() {
     compute_image_hash
     local image_tag="cvm:${IMAGE_HASH}"
 
@@ -204,6 +319,756 @@ ensure_image() {
     success "Image built: $image_tag"
 }
 
+# ── VM shared utilities ───────────────────────────────────────────────────────
+vm_cache_dir="$HOME/.cache/cvm"
+VM_BASE_IMAGE_URL="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
+
+vm_ensure_ssh_key() {
+    local key_dir="$vm_cache_dir/ssh"
+    mkdir -p "$key_dir"
+    chmod 700 "$key_dir"
+    if [[ ! -f "$key_dir/id_rsa" ]]; then
+        info "Generating VM SSH keypair..."
+        ssh-keygen -t rsa -b 4096 -f "$key_dir/id_rsa" -N "" -C "cvm" &>/dev/null
+        chmod 600 "$key_dir/id_rsa"
+        chmod 644 "$key_dir/id_rsa.pub"
+    fi
+}
+
+vm_get_install_hash() {
+    # Hash the install commands to produce a content-addressed prepared-image tag.
+    # Update this string whenever the cloud-init runcmd block changes.
+    printf '%s\n' \
+        'curl -fsSL https://deb.nodesource.com/setup_20.x | bash -' \
+        'apt-get install -y nodejs open-vm-tools' \
+        'npm install -g @anthropic-ai/claude-code' \
+        'mkdir -p /workspace && chown ubuntu:ubuntu /workspace' \
+        | sha256sum | cut -c1-12
+}
+
+vm_download_base_image() {
+    local images_dir="$vm_cache_dir/images"
+    mkdir -p "$images_dir"
+
+    local base_img="$images_dir/base.img"
+    if [[ -f "$base_img" ]]; then
+        [[ "$VERBOSE" == "true" ]] && info "Using cached base image: $base_img"
+        return 0
+    fi
+
+    info "Downloading Ubuntu 24.04 cloud image (~600MB, once)..."
+    if command -v wget &>/dev/null; then
+        wget -q --show-progress -O "$base_img.tmp" "$VM_BASE_IMAGE_URL" \
+            || die "Failed to download base image"
+    elif command -v curl &>/dev/null; then
+        curl -L --progress-bar -o "$base_img.tmp" "$VM_BASE_IMAGE_URL" \
+            || die "Failed to download base image"
+    else
+        die "Neither wget nor curl found; cannot download base image"
+    fi
+
+    mv "$base_img.tmp" "$base_img"
+    success "Base image downloaded: $base_img"
+}
+
+vm_make_seed_iso() {
+    local seed_iso="$1"
+    local user_data="$2"
+    local meta_data="$3"
+    local workdir
+    workdir="$(mktemp -d /tmp/cvm-cloudinit-XXXXXX)"
+    cp "$user_data" "$workdir/user-data"
+    cp "$meta_data" "$workdir/meta-data"
+
+    if command -v cloud-localds &>/dev/null; then
+        cloud-localds "$seed_iso" "$workdir/user-data" "$workdir/meta-data" \
+            || die "cloud-localds failed to create seed ISO"
+    elif command -v genisoimage &>/dev/null; then
+        genisoimage -output "$seed_iso" -volid cidata -joliet -rock \
+            "$workdir/user-data" "$workdir/meta-data" &>/dev/null \
+            || die "genisoimage failed to create seed ISO"
+    elif command -v mkisofs &>/dev/null; then
+        mkisofs -output "$seed_iso" -volid cidata -joliet -rock \
+            "$workdir/user-data" "$workdir/meta-data" &>/dev/null \
+            || die "mkisofs failed to create seed ISO"
+    else
+        die "No ISO creation tool found (need cloud-localds, genisoimage, or mkisofs)"
+    fi
+
+    rm -rf "$workdir"
+}
+
+vm_write_user_data() {
+    local outfile="$1"
+    local pubkey
+    pubkey="$(cat "$vm_cache_dir/ssh/id_rsa.pub")"
+
+    cat > "$outfile" <<USERDATA
+#cloud-config
+users:
+  - name: ubuntu
+    ssh_authorized_keys:
+      - ${pubkey}
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+packages:
+  - curl
+package_update: true
+runcmd:
+  - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  - apt-get install -y nodejs open-vm-tools
+  - npm install -g @anthropic-ai/claude-code
+  - mkdir -p /workspace && chown ubuntu:ubuntu /workspace
+USERDATA
+}
+
+vm_write_meta_data() {
+    local outfile="$1"
+    local instance_id="${2:-cvm-prepare}"
+    cat > "$outfile" <<METADATA
+instance-id: ${instance_id}
+local-hostname: cvm
+METADATA
+}
+
+vm_wait_for_ssh() {
+    local host="$1" port="$2"
+    local timeout=180
+    local elapsed=0
+
+    info "Waiting for SSH on $host:$port..."
+    while [[ $elapsed -lt $timeout ]]; do
+        if ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=3 \
+            -o BatchMode=yes \
+            -i "$vm_cache_dir/ssh/id_rsa" \
+            -p "$port" \
+            "ubuntu@$host" true &>/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    die "Timed out waiting for SSH on $host:$port after ${timeout}s"
+}
+
+vm_wait_for_cloud_init() {
+    local host="$1" port="$2"
+    local timeout=600
+    local elapsed=0
+
+    info "Waiting for cloud-init to finish..."
+    while [[ $elapsed -lt $timeout ]]; do
+        local status
+        status="$(ssh \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=5 \
+            -o BatchMode=yes \
+            -i "$vm_cache_dir/ssh/id_rsa" \
+            -p "$port" \
+            "ubuntu@$host" \
+            'cloud-init status 2>/dev/null || echo unknown' 2>/dev/null || echo unknown)"
+        if [[ "$status" == *"done"* ]]; then
+            return 0
+        fi
+        sleep 10
+        elapsed=$((elapsed + 10))
+    done
+    die "Timed out waiting for cloud-init after ${timeout}s"
+}
+
+vm_setup_claude_auth() {
+    local host="$1" port="$2"
+    local ssh_base="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i $vm_cache_dir/ssh/id_rsa"
+
+    ssh $ssh_base -p "$port" "ubuntu@$host" "mkdir -p /home/ubuntu/.claude" &>/dev/null
+
+    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+        scp $ssh_base -P "$port" \
+            "$HOME/.claude/.credentials.json" \
+            "ubuntu@$host:/home/ubuntu/.claude/.credentials.json" &>/dev/null
+    fi
+    if [[ -f "$HOME/.claude/settings.json" ]]; then
+        scp $ssh_base -P "$port" \
+            "$HOME/.claude/settings.json" \
+            "ubuntu@$host:/home/ubuntu/.claude/settings.json" &>/dev/null
+    fi
+    if [[ -f "$HOME/.claude.json" ]]; then
+        scp $ssh_base -P "$port" \
+            "$HOME/.claude.json" \
+            "ubuntu@$host:/home/ubuntu/.claude.json" &>/dev/null
+    fi
+}
+
+vm_copy_workspace_in() {
+    local host="$1" port="$2"
+    local ssh_base="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i $vm_cache_dir/ssh/id_rsa"
+
+    ssh $ssh_base -p "$port" "ubuntu@$host" "mkdir -p /workspace" &>/dev/null
+
+    if [[ -n "$(ls -A "$WORKSPACE" 2>/dev/null)" ]]; then
+        scp $ssh_base -P "$port" -r "$WORKSPACE/." "ubuntu@$host:/workspace/" &>/dev/null
+    fi
+}
+
+vm_run_claude_ssh() {
+    local host="$1" port="$2"
+    local ssh_base="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i $vm_cache_dir/ssh/id_rsa"
+
+    # Copy task to VM to safely handle special characters
+    local task_file
+    task_file="$(mktemp /tmp/cvm-task-XXXXXX.txt)"
+    printf '%s' "$TASK" > "$task_file"
+    scp $ssh_base -P "$port" "$task_file" "ubuntu@$host:/tmp/cvm-task.txt" &>/dev/null
+    rm -f "$task_file"
+
+    # Build API key export prefix for non-interactive SSH shells
+    local api_prefix=""
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        api_prefix="export ANTHROPIC_API_KEY=$(printf '%q' "$ANTHROPIC_API_KEY"); "
+    fi
+
+    # Remote command: $(cat /tmp/cvm-task.txt) is expanded by the remote shell
+    local remote_cmd
+    remote_cmd="${api_prefix}cd /workspace && claude --dangerously-skip-permissions --no-session-persistence -p \"\$(cat /tmp/cvm-task.txt)\" --model $MODEL"
+    [[ -n "$BUDGET" ]] && remote_cmd="$remote_cmd --max-budget-usd $BUDGET"
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        remote_cmd="$remote_cmd --output-format stream-json --verbose"
+        write_stream_json_parser
+        # shellcheck disable=SC2086
+        ssh $ssh_base -p "$port" "ubuntu@$host" "$remote_cmd" | parse_stream_json
+        return ${PIPESTATUS[0]}
+    else
+        # shellcheck disable=SC2086
+        ssh $ssh_base -p "$port" "ubuntu@$host" "$remote_cmd"
+        return $?
+    fi
+}
+
+vm_copy_workspace_out() {
+    local host="$1" port="$2"
+    local ssh_base="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i $vm_cache_dir/ssh/id_rsa"
+    scp $ssh_base -P "$port" -r "ubuntu@$host:/workspace/." "$WORKSPACE/" &>/dev/null || true
+}
+
+vm_random_port() {
+    echo $((10000 + RANDOM % 50000))
+}
+
+# ── KVM backend ───────────────────────────────────────────────────────────────
+kvm_ensure_image() {
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_img="$vm_cache_dir/images/kvm-prepared-${install_hash}.qcow2"
+
+    if [[ "$FORCE_BUILD" == "false" ]] && [[ -f "$prepared_img" ]]; then
+        [[ "$VERBOSE" == "true" ]] && info "Using cached KVM image: $prepared_img"
+        return 0
+    fi
+
+    vm_ensure_ssh_key
+    vm_download_base_image
+
+    local base_img="$vm_cache_dir/images/base.img"
+    local build_dir
+    build_dir="$(mktemp -d /tmp/cvm-kvm-build-XXXXXX)"
+    local build_port
+    build_port="$(vm_random_port)"
+
+    info "Preparing KVM image (installing claude-code, ~5 min)..."
+
+    # Create overlay on base image
+    qemu-img create -f qcow2 -b "$base_img" -F qcow2 "$build_dir/build-overlay.qcow2" \
+        &>/dev/null || die "qemu-img create failed"
+
+    # Create cloud-init seed ISO
+    vm_write_user_data "$build_dir/user-data"
+    vm_write_meta_data "$build_dir/meta-data" "cvm-kvm-prepare"
+    vm_make_seed_iso "$build_dir/seed.iso" "$build_dir/user-data" "$build_dir/meta-data"
+
+    # Boot VM to run cloud-init
+    local qemu_pid
+    qemu-system-x86_64 \
+        -enable-kvm \
+        -m 2048 \
+        -smp 2 \
+        -nographic \
+        -serial none \
+        -monitor none \
+        -drive "file=$build_dir/build-overlay.qcow2,format=qcow2" \
+        -drive "file=$build_dir/seed.iso,format=raw,readonly=on,if=virtio" \
+        -netdev "user,id=net0,hostfwd=tcp::${build_port}-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        &>/dev/null &
+    qemu_pid=$!
+
+    # Ensure qemu is cleaned up if we die
+    local cleanup_qemu="kill $qemu_pid 2>/dev/null; wait $qemu_pid 2>/dev/null; rm -rf $build_dir"
+
+    vm_wait_for_ssh localhost "$build_port" \
+        || { eval "$cleanup_qemu"; die "SSH timeout during KVM image prepare"; }
+
+    vm_wait_for_cloud_init localhost "$build_port" \
+        || { eval "$cleanup_qemu"; die "cloud-init timeout during KVM image prepare"; }
+
+    # Graceful shutdown
+    ssh \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$vm_cache_dir/ssh/id_rsa" \
+        -p "$build_port" \
+        ubuntu@localhost "sudo shutdown -h now" &>/dev/null || true
+    wait "$qemu_pid" 2>/dev/null || true
+
+    # Save prepared image
+    mv "$build_dir/build-overlay.qcow2" "$prepared_img"
+    rm -rf "$build_dir"
+    success "KVM image prepared: $prepared_img"
+}
+
+kvm_run_claude() {
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_img="$vm_cache_dir/images/kvm-prepared-${install_hash}.qcow2"
+
+    VM_PORT="$(vm_random_port)"
+    local task_dir
+    task_dir="$(mktemp -d /tmp/cvm-kvm-task-XXXXXX)"
+
+    # Create task overlay on prepared image
+    qemu-img create -f qcow2 -b "$prepared_img" -F qcow2 "$task_dir/task-overlay.qcow2" \
+        &>/dev/null || die "qemu-img create task overlay failed"
+
+    info "Starting KVM VM (SSH port $VM_PORT)..."
+    qemu-system-x86_64 \
+        -enable-kvm \
+        -m 2048 \
+        -smp 2 \
+        -nographic \
+        -serial none \
+        -monitor none \
+        -drive "file=$task_dir/task-overlay.qcow2,format=qcow2" \
+        -netdev "user,id=net0,hostfwd=tcp::${VM_PORT}-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        &>/dev/null &
+    VM_PID=$!
+
+    vm_wait_for_ssh localhost "$VM_PORT"
+    vm_setup_claude_auth localhost "$VM_PORT"
+    vm_copy_workspace_in localhost "$VM_PORT"
+
+    echo ""
+    info "Task: ${BOLD}${TASK}${RESET}"
+    info "Model: $MODEL"
+    [[ -n "$BUDGET" ]] && info "Budget: \$$BUDGET"
+    echo ""
+
+    local exit_code=0
+    vm_run_claude_ssh localhost "$VM_PORT" || exit_code=$?
+
+    vm_copy_workspace_out localhost "$VM_PORT"
+
+    # Graceful shutdown
+    ssh \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$vm_cache_dir/ssh/id_rsa" \
+        -p "$VM_PORT" \
+        ubuntu@localhost "sudo shutdown -h now" &>/dev/null || true
+    wait "$VM_PID" 2>/dev/null || true
+    VM_PID=""
+
+    if [[ "$KEEP" == "true" ]]; then
+        info "Task overlay kept at: $task_dir"
+    else
+        rm -rf "$task_dir"
+    fi
+
+    if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
+        echo ""
+        warn "Claude exited with code $exit_code"
+    fi
+
+    show_file_summary
+    return $exit_code
+}
+
+# ── VirtualBox backend ────────────────────────────────────────────────────────
+vbox_ensure_image() {
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_vm="cvm-prepared-${install_hash}"
+    local images_dir="$vm_cache_dir/images"
+    local prepared_vdi="$images_dir/vbox-prepared-${install_hash}.vdi"
+
+    # Check if prepared VM exists with "ready" snapshot
+    if [[ "$FORCE_BUILD" == "false" ]] \
+        && VBoxManage showvminfo "$prepared_vm" &>/dev/null 2>&1 \
+        && VBoxManage snapshot "$prepared_vm" list 2>/dev/null | grep -q "ready"; then
+        [[ "$VERBOSE" == "true" ]] && info "Using cached VirtualBox VM: $prepared_vm"
+        return 0
+    fi
+
+    vm_ensure_ssh_key
+    vm_download_base_image
+
+    local base_img="$vm_cache_dir/images/base.img"
+    info "Preparing VirtualBox image (installing claude-code, ~5 min)..."
+
+    # Remove old prepared VM if it exists
+    if VBoxManage showvminfo "$prepared_vm" &>/dev/null 2>&1; then
+        VBoxManage controlvm "$prepared_vm" poweroff &>/dev/null || true
+        sleep 2
+        VBoxManage unregistervm "$prepared_vm" --delete &>/dev/null || true
+    fi
+    # Also remove stale VDI file if VirtualBox didn't clean it
+    if VBoxManage list hdds 2>/dev/null | grep -q "$prepared_vdi"; then
+        VBoxManage closemedium disk "$prepared_vdi" --delete &>/dev/null || true
+    fi
+    rm -f "$prepared_vdi"
+
+    # Convert base image to a per-hash VDI
+    info "Converting base image to VDI format..."
+    qemu-img convert -f qcow2 -O vdi "$base_img" "$prepared_vdi" \
+        || die "qemu-img convert to VDI failed"
+
+    local build_port
+    build_port="$(vm_random_port)"
+    local build_dir
+    build_dir="$(mktemp -d /tmp/cvm-vbox-build-XXXXXX)"
+
+    # Create and configure VM
+    VBoxManage createvm --name "$prepared_vm" --ostype Ubuntu_64 --register \
+        || die "VBoxManage createvm failed"
+    VBoxManage modifyvm "$prepared_vm" \
+        --memory 2048 --cpus 2 \
+        --nic1 nat \
+        --natpf1 "ssh,tcp,,$build_port,,22" \
+        --boot1 disk --boot2 dvd \
+        || die "VBoxManage modifyvm failed"
+
+    # Add storage controllers
+    VBoxManage storagectl "$prepared_vm" --name "SATA" --add sata --controller IntelAhci
+    VBoxManage storagectl "$prepared_vm" --name "IDE" --add ide
+
+    # Attach VDI
+    VBoxManage storageattach "$prepared_vm" \
+        --storagectl "SATA" --port 0 --device 0 --type hdd \
+        --medium "$prepared_vdi" \
+        || die "Failed to attach VDI"
+
+    # Create cloud-init seed ISO
+    vm_write_user_data "$build_dir/user-data"
+    vm_write_meta_data "$build_dir/meta-data" "cvm-vbox-prepare"
+    vm_make_seed_iso "$build_dir/seed.iso" "$build_dir/user-data" "$build_dir/meta-data"
+
+    VBoxManage storageattach "$prepared_vm" \
+        --storagectl "IDE" --port 0 --device 0 --type dvddrive \
+        --medium "$build_dir/seed.iso" \
+        || die "Failed to attach seed ISO"
+
+    # Start VM
+    VBoxManage startvm "$prepared_vm" --type headless \
+        || die "VBoxManage startvm failed"
+
+    vm_wait_for_ssh localhost "$build_port" \
+        || { VBoxManage controlvm "$prepared_vm" poweroff &>/dev/null || true
+             VBoxManage unregistervm "$prepared_vm" --delete &>/dev/null || true
+             rm -rf "$build_dir"; die "SSH timeout during VirtualBox image prepare"; }
+
+    vm_wait_for_cloud_init localhost "$build_port" \
+        || { VBoxManage controlvm "$prepared_vm" poweroff &>/dev/null || true
+             VBoxManage unregistervm "$prepared_vm" --delete &>/dev/null || true
+             rm -rf "$build_dir"; die "cloud-init timeout during VirtualBox image prepare"; }
+
+    # Graceful shutdown
+    ssh \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$vm_cache_dir/ssh/id_rsa" \
+        -p "$build_port" \
+        ubuntu@localhost "sudo shutdown -h now" &>/dev/null || true
+    sleep 8  # wait for VirtualBox to complete shutdown
+
+    # Remove port forwarding rule before taking snapshot (task VMs add their own)
+    VBoxManage modifyvm "$prepared_vm" --natpf1 delete "ssh" &>/dev/null || true
+
+    # Detach seed ISO
+    VBoxManage storageattach "$prepared_vm" \
+        --storagectl "IDE" --port 0 --device 0 --type dvddrive \
+        --medium none &>/dev/null || true
+
+    # Take snapshot
+    VBoxManage snapshot "$prepared_vm" take ready \
+        || die "VBoxManage snapshot take ready failed"
+
+    rm -rf "$build_dir"
+    success "VirtualBox VM prepared: $prepared_vm (snapshot: ready)"
+}
+
+vbox_run_claude() {
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_vm="cvm-prepared-${install_hash}"
+
+    VM_NAME="cvm-task-$$"
+    VM_PORT="$(vm_random_port)"
+
+    info "Cloning VirtualBox VM for task (linked clone)..."
+    VBoxManage clonevm "$prepared_vm" \
+        --snapshot ready \
+        --name "$VM_NAME" \
+        --register \
+        --options link \
+        || die "VBoxManage clonevm failed"
+
+    VBoxManage modifyvm "$VM_NAME" \
+        --natpf1 "ssh,tcp,,$VM_PORT,,22" \
+        || die "VBoxManage modifyvm (port forward) failed"
+
+    VBoxManage startvm "$VM_NAME" --type headless \
+        || die "VBoxManage startvm failed"
+
+    vm_wait_for_ssh localhost "$VM_PORT"
+    vm_setup_claude_auth localhost "$VM_PORT"
+    vm_copy_workspace_in localhost "$VM_PORT"
+
+    echo ""
+    info "Task: ${BOLD}${TASK}${RESET}"
+    info "Model: $MODEL"
+    [[ -n "$BUDGET" ]] && info "Budget: \$$BUDGET"
+    echo ""
+
+    local exit_code=0
+    vm_run_claude_ssh localhost "$VM_PORT" || exit_code=$?
+
+    vm_copy_workspace_out localhost "$VM_PORT"
+
+    # Stop and delete task VM
+    VBoxManage controlvm "$VM_NAME" poweroff &>/dev/null || true
+    sleep 2
+    VBoxManage unregistervm "$VM_NAME" --delete &>/dev/null || true
+    VM_NAME=""
+
+    if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
+        echo ""
+        warn "Claude exited with code $exit_code"
+    fi
+
+    show_file_summary
+    return $exit_code
+}
+
+# ── VMware backend ────────────────────────────────────────────────────────────
+vmware_write_vmx() {
+    local vmx_file="$1"
+    local vmdk_name="$2"
+    local cdrom_iso="$3"  # empty = no cdrom
+    local memory="$4"
+
+    cat > "$vmx_file" <<VMXEOF
+.encoding = "UTF-8"
+config.version = "8"
+virtualHW.version = "19"
+memsize = "${memory}"
+numvcpus = "2"
+guestOS = "ubuntu-64"
+displayName = "cvm"
+scsi0.present = "TRUE"
+scsi0.virtualDev = "pvscsi"
+scsi0:0.present = "TRUE"
+scsi0:0.fileName = "${vmdk_name}"
+scsi0:0.deviceType = "disk"
+ethernet0.present = "TRUE"
+ethernet0.connectionType = "nat"
+ethernet0.virtualDev = "vmxnet3"
+ethernet0.addressType = "generated"
+usb.present = "FALSE"
+sound.present = "FALSE"
+tools.syncTime = "FALSE"
+vmci0.present = "FALSE"
+VMXEOF
+
+    if [[ -n "$cdrom_iso" ]]; then
+        cat >> "$vmx_file" <<CDROM
+ide1:0.present = "TRUE"
+ide1:0.fileName = "${cdrom_iso}"
+ide1:0.deviceType = "cdrom-image"
+CDROM
+    fi
+}
+
+vmware_get_guest_ip() {
+    local vmx_file="$1"
+    local timeout=120
+    local elapsed=0
+    while [[ $elapsed -lt $timeout ]]; do
+        local ip
+        ip="$(vmrun -T "$VMWARE_PROVIDER" getGuestIPAddress "$vmx_file" -wait 2>/dev/null || true)"
+        if [[ -n "$ip" ]] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    return 1
+}
+
+vmware_ensure_image() {
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_dir="$vm_cache_dir/images/vmware-prepared-${install_hash}"
+    local vmx_file="$prepared_dir/ubuntu.vmx"
+
+    if [[ "$FORCE_BUILD" == "false" ]] \
+        && [[ -f "$vmx_file" ]] \
+        && vmrun -T "$VMWARE_PROVIDER" listSnapshots "$vmx_file" 2>/dev/null | grep -q "ready"; then
+        [[ "$VERBOSE" == "true" ]] && info "Using cached VMware image: $prepared_dir"
+        return 0
+    fi
+
+    vm_ensure_ssh_key
+    vm_download_base_image
+
+    local base_img="$vm_cache_dir/images/base.img"
+    info "Preparing VMware image (installing claude-code, ~5 min)..."
+
+    # Remove old prepared dir if exists
+    if [[ -d "$prepared_dir" ]]; then
+        vmrun -T "$VMWARE_PROVIDER" stop "$vmx_file" hard &>/dev/null || true
+        rm -rf "$prepared_dir"
+    fi
+    mkdir -p "$prepared_dir"
+
+    # Convert base image to VMDK
+    info "Converting base image to VMDK format..."
+    qemu-img convert -f qcow2 -O vmdk "$base_img" "$prepared_dir/ubuntu.vmdk" \
+        || die "qemu-img convert to VMDK failed"
+
+    # Create cloud-init seed ISO
+    vm_write_user_data "$prepared_dir/user-data"
+    vm_write_meta_data "$prepared_dir/meta-data" "cvm-vmware-prepare"
+    vm_make_seed_iso "$prepared_dir/seed.iso" \
+        "$prepared_dir/user-data" "$prepared_dir/meta-data"
+
+    # Write VMX with cdrom attached for cloud-init
+    vmware_write_vmx "$vmx_file" "ubuntu.vmdk" "seed.iso" 2048
+
+    # Start VM
+    vmrun -T "$VMWARE_PROVIDER" start "$vmx_file" nogui \
+        || die "vmrun start failed"
+
+    # Get guest IP (requires open-vm-tools in guest)
+    info "Getting VM IP address..."
+    local vm_ip
+    vm_ip="$(vmware_get_guest_ip "$vmx_file")" \
+        || { vmrun -T "$VMWARE_PROVIDER" stop "$vmx_file" hard &>/dev/null || true
+             die "Could not get VMware guest IP address (is open-vm-tools installed?)"; }
+
+    vm_wait_for_ssh "$vm_ip" 22 \
+        || { vmrun -T "$VMWARE_PROVIDER" stop "$vmx_file" hard &>/dev/null || true
+             die "SSH timeout during VMware image prepare"; }
+
+    vm_wait_for_cloud_init "$vm_ip" 22 \
+        || { vmrun -T "$VMWARE_PROVIDER" stop "$vmx_file" hard &>/dev/null || true
+             die "cloud-init timeout during VMware image prepare"; }
+
+    # Graceful shutdown
+    ssh \
+        -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o BatchMode=yes -o ConnectTimeout=5 \
+        -i "$vm_cache_dir/ssh/id_rsa" \
+        -p 22 \
+        "ubuntu@$vm_ip" "sudo shutdown -h now" &>/dev/null || true
+    sleep 10
+
+    # Rewrite VMX without cdrom for clean snapshot
+    vmware_write_vmx "$vmx_file" "ubuntu.vmdk" "" 2048
+
+    # Clean up cloud-init temp files
+    rm -f "$prepared_dir/user-data" "$prepared_dir/meta-data" "$prepared_dir/seed.iso"
+
+    # Take snapshot
+    vmrun -T "$VMWARE_PROVIDER" snapshot "$vmx_file" ready \
+        || die "vmrun snapshot failed"
+
+    success "VMware image prepared: $prepared_dir (snapshot: ready)"
+}
+
+vmware_run_claude() {
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_dir="$vm_cache_dir/images/vmware-prepared-${install_hash}"
+    local prepared_vmx="$prepared_dir/ubuntu.vmx"
+
+    VM_TASK_DIR="$(mktemp -d /tmp/cvm-vmware-task-XXXXXX)"
+    VM_NAME="$VM_TASK_DIR/ubuntu.vmx"
+
+    info "Copying VMware image for task..."
+    cp -r "$prepared_dir/." "$VM_TASK_DIR/"
+
+    # Write VMX without cdrom for task run
+    vmware_write_vmx "$VM_TASK_DIR/ubuntu.vmx" "ubuntu.vmdk" "" 2048
+
+    # Revert to "ready" snapshot (operates on the copy)
+    vmrun -T "$VMWARE_PROVIDER" revertToSnapshot "$VM_TASK_DIR/ubuntu.vmx" ready \
+        &>/dev/null || true
+
+    # Start task VM
+    vmrun -T "$VMWARE_PROVIDER" start "$VM_TASK_DIR/ubuntu.vmx" nogui \
+        || die "vmrun start (task) failed"
+
+    # Get guest IP
+    info "Getting VM IP address..."
+    local vm_ip
+    vm_ip="$(vmware_get_guest_ip "$VM_TASK_DIR/ubuntu.vmx")" \
+        || die "Could not get VMware guest IP address"
+
+    vm_wait_for_ssh "$vm_ip" 22
+    vm_setup_claude_auth "$vm_ip" 22
+    vm_copy_workspace_in "$vm_ip" 22
+
+    echo ""
+    info "Task: ${BOLD}${TASK}${RESET}"
+    info "Model: $MODEL"
+    [[ -n "$BUDGET" ]] && info "Budget: \$$BUDGET"
+    echo ""
+
+    local exit_code=0
+    vm_run_claude_ssh "$vm_ip" 22 || exit_code=$?
+
+    vm_copy_workspace_out "$vm_ip" 22
+
+    # Stop and remove task VM
+    vmrun -T "$VMWARE_PROVIDER" stop "$VM_TASK_DIR/ubuntu.vmx" hard &>/dev/null || true
+    rm -rf "$VM_TASK_DIR"
+    VM_TASK_DIR=""
+    VM_NAME=""
+
+    if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
+        echo ""
+        warn "Claude exited with code $exit_code"
+    fi
+
+    show_file_summary
+    return $exit_code
+}
+
+# ── Image preparation dispatcher ──────────────────────────────────────────────
+ensure_image() {
+    case "$BACKEND" in
+        docker)     docker_ensure_image ;;
+        kvm)        kvm_ensure_image ;;
+        virtualbox) vbox_ensure_image ;;
+        vmware)     vmware_ensure_image ;;
+    esac
+}
+
 # ── Workspace ─────────────────────────────────────────────────────────────────
 WORKSPACE=""
 CLAUDE_TMP=""
@@ -221,17 +1086,19 @@ create_workspace() {
         [[ "$VERBOSE" == "true" ]] && info "Copied $DIR → $WORKSPACE"
     fi
 
-    # Create a writable temp ~/.claude dir for the container.
+    # Docker only: create a writable temp ~/.claude dir for the container.
     # Claude writes todos/, debug/, history.jsonl, etc. even in --no-session-persistence
     # mode — mounting the host ~/.claude read-only causes EROFS errors.
-    # We copy only the auth/config files in; the rest is ephemeral.
-    CLAUDE_TMP="$(mktemp -d /tmp/cvm-claude-XXXXXX)"
-    chmod 777 "$CLAUDE_TMP"
-    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
-        cp "$HOME/.claude/.credentials.json" "$CLAUDE_TMP/.credentials.json"
-    fi
-    if [[ -f "$HOME/.claude/settings.json" ]]; then
-        cp "$HOME/.claude/settings.json" "$CLAUDE_TMP/settings.json"
+    # VM backends copy credentials via SSH in vm_setup_claude_auth() instead.
+    if [[ "$BACKEND" == "docker" ]]; then
+        CLAUDE_TMP="$(mktemp -d /tmp/cvm-claude-XXXXXX)"
+        chmod 777 "$CLAUDE_TMP"
+        if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+            cp "$HOME/.claude/.credentials.json" "$CLAUDE_TMP/.credentials.json"
+        fi
+        if [[ -f "$HOME/.claude/settings.json" ]]; then
+            cp "$HOME/.claude/settings.json" "$CLAUDE_TMP/settings.json"
+        fi
     fi
 }
 
@@ -263,7 +1130,7 @@ show_file_summary() {
 # ── Stream-JSON parser ────────────────────────────────────────────────────────
 # Used only in --verbose mode to pretty-print tool calls and cost info.
 # Note: python3 reads the script from a temp file so that stdin remains
-# connected to the docker pipe (a heredoc would consume stdin for the script).
+# connected to the docker/ssh pipe (a heredoc would consume stdin for the script).
 STREAM_JSON_PARSER=""
 
 write_stream_json_parser() {
@@ -338,6 +1205,33 @@ parse_stream_json() {
 cleanup() {
     local exit_code=$?
 
+    # VM-specific teardown
+    case "${BACKEND:-}" in
+        kvm)
+            if [[ -n "$VM_PID" ]]; then
+                kill "$VM_PID" &>/dev/null || true
+                wait "$VM_PID" 2>/dev/null || true
+                VM_PID=""
+            fi
+            ;;
+        virtualbox)
+            if [[ -n "$VM_NAME" ]]; then
+                VBoxManage controlvm "$VM_NAME" poweroff &>/dev/null || true
+                sleep 2
+                VBoxManage unregistervm "$VM_NAME" --delete &>/dev/null || true
+                VM_NAME=""
+            fi
+            ;;
+        vmware)
+            if [[ -n "$VM_TASK_DIR" ]] && [[ -f "$VM_TASK_DIR/ubuntu.vmx" ]]; then
+                vmrun -T "${VMWARE_PROVIDER:-ws}" stop "$VM_TASK_DIR/ubuntu.vmx" hard \
+                    &>/dev/null || true
+                rm -rf "$VM_TASK_DIR"
+                VM_TASK_DIR=""
+            fi
+            ;;
+    esac
+
     # Copy output if requested
     if [[ -n "$OUT" ]] && [[ -d "$WORKSPACE" ]]; then
         mkdir -p "$OUT"
@@ -361,15 +1255,29 @@ cleanup() {
 
 handle_interrupt() {
     echo ""
-    warn "Interrupted — stopping container..."
-    docker stop "cvm-$$" &>/dev/null || true
+    warn "Interrupted — stopping..."
+    case "${BACKEND:-}" in
+        docker)
+            docker stop "cvm-$$" &>/dev/null || true ;;
+        kvm)
+            [[ -n "$VM_PID" ]] && kill "$VM_PID" &>/dev/null || true ;;
+        virtualbox)
+            [[ -n "$VM_NAME" ]] && \
+                VBoxManage controlvm "$VM_NAME" poweroff &>/dev/null || true ;;
+        vmware)
+            if [[ -n "$VM_TASK_DIR" ]] && [[ -f "$VM_TASK_DIR/ubuntu.vmx" ]]; then
+                vmrun -T "${VMWARE_PROVIDER:-ws}" stop "$VM_TASK_DIR/ubuntu.vmx" hard \
+                    &>/dev/null || true
+            fi
+            ;;
+    esac
     [[ -n "$CLAUDE_TMP" ]] && rm -rf "$CLAUDE_TMP"
     [[ -n "$STREAM_JSON_PARSER" ]] && rm -f "$STREAM_JSON_PARSER"
     exit 130
 }
 
-# ── Run Claude ────────────────────────────────────────────────────────────────
-run_claude() {
+# ── Docker run ────────────────────────────────────────────────────────────────
+docker_run_claude() {
     local image_tag="cvm:${IMAGE_HASH}"
 
     # Build docker run arguments
@@ -384,8 +1292,6 @@ run_claude() {
     )
 
     # Mount writable temp ~/.claude dir (contains copied credentials/settings).
-    # We can't mount the host ~/.claude read-only: Claude writes todos/, debug/,
-    # history.jsonl, etc. and fails with EROFS if the mount is read-only.
     docker_args+=(-v "$CLAUDE_TMP:/home/ubuntu/.claude")
     # Also mount ~/.claude.json (top-level config file, separate from ~/.claude/)
     if [[ -f "$HOME/.claude.json" ]]; then
@@ -417,10 +1323,6 @@ run_claude() {
         claude_args+=(--output-format stream-json --verbose)
     fi
 
-    # Register signal handlers
-    trap 'handle_interrupt' INT TERM
-    trap 'cleanup' EXIT
-
     echo ""
     info "Task: ${BOLD}${TASK}${RESET}"
     info "Model: $MODEL"
@@ -447,11 +1349,26 @@ run_claude() {
     return $exit_code
 }
 
+# ── Run dispatcher ────────────────────────────────────────────────────────────
+run_claude() {
+    # Register signal handlers (all backends)
+    trap 'handle_interrupt' INT TERM
+    trap 'cleanup' EXIT
+
+    case "$BACKEND" in
+        docker)     docker_run_claude ;;
+        kvm)        kvm_run_claude ;;
+        virtualbox) vbox_run_claude ;;
+        vmware)     vmware_run_claude ;;
+    esac
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
     parse_args "$@"
     setup_colors
-    check_docker
+    detect_backend
+    check_deps
     check_auth
     ensure_image
     create_workspace
