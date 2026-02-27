@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# cvm — Claude VM
+# Runs 'claude --dangerously-skip-permissions -p' inside a Docker container
+# for isolated, fully autonomous task execution.
+set -euo pipefail
+
+# ── Version ───────────────────────────────────────────────────────────────────
+VERSION="0.1.0"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
+MODEL="claude-sonnet-4-6"
+DIR=""
+KEEP=false
+OUT=""
+BUDGET=""
+FORCE_BUILD=false
+NO_COLOR=false
+VERBOSE=false
+TASK=""
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+# Initialize with color codes by default; setup_colors() clears them if needed
+RED=$'\033[0;31m'
+YELLOW=$'\033[0;33m'
+GREEN=$'\033[0;32m'
+CYAN=$'\033[0;36m'
+BOLD=$'\033[1m'
+DIM=$'\033[2m'
+RESET=$'\033[0m'
+
+setup_colors() {
+    if [[ "$NO_COLOR" == "true" ]] || [[ ! -t 1 ]]; then
+        RED="" YELLOW="" GREEN="" CYAN="" BOLD="" DIM="" RESET=""
+    fi
+}
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+info()    { echo -e "${CYAN}[cvm]${RESET} $*"; }
+success() { echo -e "${GREEN}[cvm]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[cvm]${RESET} $*" >&2; }
+error()   { echo -e "${RED}[cvm] error:${RESET} $*" >&2; }
+die()     { error "$*"; exit 1; }
+
+# ── Help ──────────────────────────────────────────────────────────────────────
+show_help() {
+    cat <<EOF
+${BOLD}cvm${RESET} — Claude VM v${VERSION}
+
+Run Claude Code inside a Docker sandbox for fully autonomous task execution.
+
+${BOLD}USAGE${RESET}
+    cvm [OPTIONS] "task description"
+    echo "task" | cvm [OPTIONS]
+
+${BOLD}OPTIONS${RESET}
+    -d, --dir DIR       Copy directory into workspace before run
+    -k, --keep          Keep workspace dir after completion
+    -m, --model MODEL   Claude model (default: ${MODEL})
+    -o, --out DIR       Copy workspace output to DIR after run
+    -b, --budget USD    Max spend in USD (e.g. 1.00)
+        --build         Force rebuild Docker image
+        --no-color      Disable ANSI colors
+    -v, --verbose       Verbose mode (shows docker build output + stream-json)
+    -h, --help          Show this help
+        --version       Show version
+
+${BOLD}EXAMPLES${RESET}
+    cvm "write a Python web scraper for example.com"
+    cvm --dir ./src "refactor this codebase to use async/await"
+    cvm --out ./results --budget 2.00 "analyze this dataset and generate charts"
+    echo "fix all TypeScript errors" | cvm --dir .
+
+${BOLD}AUTH${RESET}
+    OAuth:   Run 'claude auth login' on the host first (~/.claude is mounted)
+    API key: Set ANTHROPIC_API_KEY environment variable
+EOF
+}
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+parse_args() {
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--dir)
+                [[ $# -lt 2 ]] && die "--dir requires an argument"
+                DIR="$2"; shift 2 ;;
+            -k|--keep)
+                KEEP=true; shift ;;
+            -m|--model)
+                [[ $# -lt 2 ]] && die "--model requires an argument"
+                MODEL="$2"; shift 2 ;;
+            -o|--out)
+                [[ $# -lt 2 ]] && die "--out requires an argument"
+                OUT="$2"; shift 2 ;;
+            -b|--budget)
+                [[ $# -lt 2 ]] && die "--budget requires an argument"
+                BUDGET="$2"; shift 2 ;;
+            --build)
+                FORCE_BUILD=true; shift ;;
+            --no-color)
+                NO_COLOR=true; shift ;;
+            -v|--verbose)
+                VERBOSE=true; shift ;;
+            -h|--help)
+                show_help; exit 0 ;;
+            --version)
+                echo "cvm $VERSION"; exit 0 ;;
+            --)
+                shift; args+=("$@"); break ;;
+            -*)
+                die "Unknown option: $1" ;;
+            *)
+                args+=("$1"); shift ;;
+        esac
+    done
+
+    # Join remaining args as the task
+    if [[ ${#args[@]} -gt 0 ]]; then
+        TASK="${args[*]}"
+    fi
+
+    # Read from stdin if piped and no task given
+    if [[ -z "$TASK" ]] && [[ ! -t 0 ]]; then
+        TASK="$(cat)"
+    fi
+
+    if [[ -z "$TASK" ]]; then
+        show_help
+        echo ""
+        die "No task provided. Pass a task as an argument or pipe it via stdin."
+    fi
+}
+
+# ── Docker check ──────────────────────────────────────────────────────────────
+check_docker() {
+    if ! command -v docker &>/dev/null; then
+        die "docker not found in PATH.
+  On WSL: Enable WSL Integration in Docker Desktop:
+    Settings > Resources > WSL Integration > Enable for your distro"
+    fi
+
+    if ! docker info &>/dev/null; then
+        die "Docker is not running or not accessible.
+  Start Docker Desktop on Windows, then wait a few seconds and retry."
+    fi
+}
+
+# ── Auth check ────────────────────────────────────────────────────────────────
+check_auth() {
+    local has_auth=false
+
+    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+        has_auth=true
+    fi
+
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        has_auth=true
+    fi
+
+    if [[ "$has_auth" == "false" ]]; then
+        die "No Claude authentication found.
+  Option 1 (OAuth): Run 'claude auth login' on the host
+  Option 2 (API key): Set ANTHROPIC_API_KEY environment variable"
+    fi
+}
+
+# ── Image build ───────────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOCKERFILE="$SCRIPT_DIR/Dockerfile"
+IMAGE_HASH=""
+
+compute_image_hash() {
+    if [[ ! -f "$DOCKERFILE" ]]; then
+        die "Dockerfile not found at: $DOCKERFILE"
+    fi
+    IMAGE_HASH="$(sha256sum "$DOCKERFILE" | cut -c1-12)"
+}
+
+ensure_image() {
+    compute_image_hash
+    local image_tag="cvm:${IMAGE_HASH}"
+
+    if [[ "$FORCE_BUILD" == "false" ]] && docker image inspect "$image_tag" &>/dev/null; then
+        [[ "$VERBOSE" == "true" ]] && info "Using cached image: $image_tag"
+        return 0
+    fi
+
+    info "Building Docker image $image_tag..."
+
+    local build_args=(
+        build
+        -t "$image_tag"
+        -f "$DOCKERFILE"
+        "$SCRIPT_DIR"
+    )
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        docker "${build_args[@]}" || die "Docker image build failed."
+    else
+        docker "${build_args[@]}" &>/dev/null \
+            || die "Docker image build failed. Run with -v for details."
+    fi
+
+    success "Image built: $image_tag"
+}
+
+# ── Workspace ─────────────────────────────────────────────────────────────────
+WORKSPACE=""
+CLAUDE_TMP=""
+
+create_workspace() {
+    WORKSPACE="$(mktemp -d /tmp/cvm-workspace-XXXXXX)"
+    chmod 777 "$WORKSPACE"  # allow container's non-root user to write
+
+    if [[ -n "$DIR" ]]; then
+        if [[ ! -d "$DIR" ]]; then
+            die "Directory not found: $DIR"
+        fi
+        cp -r "$DIR/." "$WORKSPACE/"
+        chmod -R a+rw "$WORKSPACE"  # ensure container user can read/write copied files
+        [[ "$VERBOSE" == "true" ]] && info "Copied $DIR → $WORKSPACE"
+    fi
+
+    # Create a writable temp ~/.claude dir for the container.
+    # Claude writes todos/, debug/, history.jsonl, etc. even in --no-session-persistence
+    # mode — mounting the host ~/.claude read-only causes EROFS errors.
+    # We copy only the auth/config files in; the rest is ephemeral.
+    CLAUDE_TMP="$(mktemp -d /tmp/cvm-claude-XXXXXX)"
+    chmod 777 "$CLAUDE_TMP"
+    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+        cp "$HOME/.claude/.credentials.json" "$CLAUDE_TMP/.credentials.json"
+    fi
+    if [[ -f "$HOME/.claude/settings.json" ]]; then
+        cp "$HOME/.claude/settings.json" "$CLAUDE_TMP/settings.json"
+    fi
+}
+
+# ── File summary ──────────────────────────────────────────────────────────────
+show_file_summary() {
+    if [[ ! -d "$WORKSPACE" ]]; then return; fi
+
+    local file_count
+    file_count="$(find "$WORKSPACE" -type f | wc -l)"
+
+    if [[ "$file_count" -eq 0 ]]; then
+        info "Workspace: no files created"
+        return
+    fi
+
+    local total_size
+    total_size="$(du -sh "$WORKSPACE" 2>/dev/null | cut -f1)"
+
+    echo ""
+    info "Workspace contents (${file_count} files, ${total_size} total):"
+    find "$WORKSPACE" -type f | sort | while read -r f; do
+        local rel="${f#$WORKSPACE/}"
+        local sz
+        sz="$(du -sh "$f" 2>/dev/null | cut -f1)"
+        echo -e "  ${DIM}${sz}${RESET}  ${rel}"
+    done
+}
+
+# ── Stream-JSON parser ────────────────────────────────────────────────────────
+# Used only in --verbose mode to pretty-print tool calls and cost info.
+# Note: python3 reads the script from a temp file so that stdin remains
+# connected to the docker pipe (a heredoc would consume stdin for the script).
+STREAM_JSON_PARSER=""
+
+write_stream_json_parser() {
+    STREAM_JSON_PARSER="$(mktemp /tmp/cvm-parser-XXXXXX.py)"
+    cat > "$STREAM_JSON_PARSER" <<'PYEOF'
+import sys, json
+
+for line in sys.stdin:
+    line = line.rstrip('\n')
+    if not line:
+        continue
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        print(line)
+        continue
+
+    t = obj.get('type', '')
+
+    if t == 'text':
+        text = obj.get('text', '')
+        if text:
+            print(text, end='', flush=True)
+
+    elif t == 'tool_use':
+        name = obj.get('name', '')
+        inp = obj.get('input', {})
+        print(f'\n\033[36m[tool: {name}]\033[0m', flush=True)
+        if isinstance(inp, dict):
+            for k, v in inp.items():
+                v_str = str(v)
+                if len(v_str) > 200:
+                    v_str = v_str[:200] + '...'
+                print(f'  {k}: {v_str}')
+
+    elif t == 'tool_result':
+        content = obj.get('content', '')
+        if isinstance(content, str) and content:
+            truncated = content[:300] + '...' if len(content) > 300 else content
+            print(f'\033[2m  \u2192 {truncated}\033[0m', flush=True)
+
+    elif t == 'result':
+        cost = obj.get('cost_usd')
+        usage = obj.get('usage', {})
+        turns = obj.get('num_turns')
+        print('', flush=True)
+        if cost is not None:
+            print(f'\033[32m[cvm] cost: ${cost:.4f} USD\033[0m')
+        if turns is not None:
+            print(f'\033[2m[cvm] turns: {turns}\033[0m')
+        if usage:
+            inp_tok = usage.get('input_tokens', 0)
+            out_tok = usage.get('output_tokens', 0)
+            print(f'\033[2m[cvm] tokens: {inp_tok} in / {out_tok} out\033[0m')
+
+    elif t == 'error':
+        msg = obj.get('message', str(obj))
+        print(f'\033[31m[error] {msg}\033[0m', file=sys.stderr)
+
+    else:
+        raw = obj.get('text') or obj.get('content') or ''
+        if raw:
+            print(raw, end='', flush=True)
+PYEOF
+}
+
+parse_stream_json() {
+    python3 -u "$STREAM_JSON_PARSER"
+}
+
+# ── Cleanup ───────────────────────────────────────────────────────────────────
+cleanup() {
+    local exit_code=$?
+
+    # Copy output if requested
+    if [[ -n "$OUT" ]] && [[ -d "$WORKSPACE" ]]; then
+        mkdir -p "$OUT"
+        cp -r "$WORKSPACE/." "$OUT/"
+        success "Workspace copied to: $OUT"
+    fi
+
+    # Remove workspace unless --keep
+    if [[ "$KEEP" == "false" ]] && [[ -d "$WORKSPACE" ]]; then
+        rm -rf "$WORKSPACE"
+    elif [[ "$KEEP" == "true" ]] && [[ -d "$WORKSPACE" ]]; then
+        info "Workspace kept at: $WORKSPACE"
+    fi
+
+    # Clean up temp files
+    [[ -n "$STREAM_JSON_PARSER" ]] && rm -f "$STREAM_JSON_PARSER"
+    [[ -n "$CLAUDE_TMP" ]] && rm -rf "$CLAUDE_TMP"
+
+    exit $exit_code
+}
+
+handle_interrupt() {
+    echo ""
+    warn "Interrupted — stopping container..."
+    docker stop "cvm-$$" &>/dev/null || true
+    [[ -n "$CLAUDE_TMP" ]] && rm -rf "$CLAUDE_TMP"
+    [[ -n "$STREAM_JSON_PARSER" ]] && rm -f "$STREAM_JSON_PARSER"
+    exit 130
+}
+
+# ── Run Claude ────────────────────────────────────────────────────────────────
+run_claude() {
+    local image_tag="cvm:${IMAGE_HASH}"
+
+    # Build docker run arguments
+    local docker_args=(
+        run
+        --rm
+        --name "cvm-$$"
+        -v "${WORKSPACE}:/workspace"
+        -e "TERM=xterm-256color"
+        -w /workspace
+        --network bridge
+    )
+
+    # Mount writable temp ~/.claude dir (contains copied credentials/settings).
+    # We can't mount the host ~/.claude read-only: Claude writes todos/, debug/,
+    # history.jsonl, etc. and fails with EROFS if the mount is read-only.
+    docker_args+=(-v "$CLAUDE_TMP:/home/ubuntu/.claude")
+    # Also mount ~/.claude.json (top-level config file, separate from ~/.claude/)
+    if [[ -f "$HOME/.claude.json" ]]; then
+        docker_args+=(-v "$HOME/.claude.json:/home/ubuntu/.claude.json:ro")
+    fi
+    docker_args+=(-e "HOME=/home/ubuntu")
+
+    # Pass API key if set
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        docker_args+=(-e "ANTHROPIC_API_KEY")
+    fi
+
+    docker_args+=("$image_tag")
+
+    # Build claude command arguments
+    local claude_args=(
+        claude
+        --dangerously-skip-permissions
+        --no-session-persistence
+        -p "$TASK"
+        --model "$MODEL"
+    )
+
+    if [[ -n "$BUDGET" ]]; then
+        claude_args+=(--max-budget-usd "$BUDGET")
+    fi
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        claude_args+=(--output-format stream-json --verbose)
+    fi
+
+    # Register signal handlers
+    trap 'handle_interrupt' INT TERM
+    trap 'cleanup' EXIT
+
+    echo ""
+    info "Task: ${BOLD}${TASK}${RESET}"
+    info "Model: $MODEL"
+    [[ -n "$BUDGET" ]] && info "Budget: \$$BUDGET"
+    echo ""
+
+    local exit_code=0
+    if [[ "$VERBOSE" == "true" ]]; then
+        write_stream_json_parser
+        docker "${docker_args[@]}" "${claude_args[@]}" | parse_stream_json
+        exit_code=${PIPESTATUS[0]}
+    else
+        docker "${docker_args[@]}" "${claude_args[@]}"
+        exit_code=$?
+    fi
+
+    if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
+        echo ""
+        warn "Claude exited with code $exit_code"
+    fi
+
+    show_file_summary
+
+    return $exit_code
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+main() {
+    parse_args "$@"
+    setup_colors
+    check_docker
+    check_auth
+    ensure_image
+    create_workspace
+    run_claude
+}
+
+main "$@"
