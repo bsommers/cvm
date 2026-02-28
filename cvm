@@ -698,6 +698,45 @@ kvm_run_claude() {
 }
 
 # ── VirtualBox backend ────────────────────────────────────────────────────────
+# Fixed MAC for all cvm VirtualBox VMs. Cloud-init writes a MAC-specific netplan
+# config; using the same MAC on both the prepared VM and every task clone ensures
+# the guest always gets a DHCP lease from VirtualBox NAT.
+VBOX_CVM_MAC="080027434D56"
+
+vbox_reload_config() {
+    # VBoxSVC caches VM configs in memory after --register.  Direct edits to the
+    # .vbox file are ignored until we unregister and re-register so VBoxSVC re-reads.
+    local vm_name="$1"
+    local vbox_file
+    vbox_file="$(VBoxManage showvminfo "$vm_name" --machinereadable 2>/dev/null \
+        | grep '^CfgFile=' | cut -d'"' -f2)"
+    [[ -z "$vbox_file" ]] && die "Could not locate .vbox file for VM: $vm_name"
+    VBoxManage unregistervm "$vm_name" &>/dev/null || true
+    VBoxManage registervm "$vbox_file" &>/dev/null \
+        || die "Failed to re-register VM after config patch: $vm_name"
+}
+
+vbox_set_nat_forwarding() {
+    # VBoxManage 7.2.x has a bug where --natpf1 on a linked clone writes
+    # hostport=0 to the .vbox XML.  Work around it by patching the XML directly,
+    # then forcing VBoxSVC to reload the config via unregister+re-register.
+    local vm_name="$1" port="$2"
+    local vbox_file
+    vbox_file="$(VBoxManage showvminfo "$vm_name" --machinereadable 2>/dev/null \
+        | grep '^CfgFile=' | cut -d'"' -f2)"
+    [[ -z "$vbox_file" ]] && die "Could not locate .vbox file for VM: $vm_name"
+
+    # Replace any self-closing <NAT.../> with <NAT...><Forwarding.../></NAT>.
+    # Uses -E extended regex so [^>]* captures any attributes (e.g. localhost-reachable).
+    sed -E -i "s|<NAT([^>]*)/>|<NAT\1><Forwarding name=\"ssh\" proto=\"1\" hostport=\"${port}\" guestport=\"22\"/></NAT>|g" \
+        "$vbox_file"
+
+    grep -q "hostport=\"${port}\"" "$vbox_file" \
+        || die "Failed to patch NAT port forwarding in $vbox_file"
+
+    vbox_reload_config "$vm_name"
+}
+
 vbox_ensure_image() {
     local install_hash
     install_hash="$(vm_get_install_hash)"
@@ -741,15 +780,19 @@ vbox_ensure_image() {
     local build_dir
     build_dir="$(mktemp -d /tmp/cvm-vbox-build-XXXXXX)"
 
-    # Create and configure VM
+    # Create and configure VM; use VBOX_CVM_MAC so cloud-init's netplan config
+    # (which is MAC-specific) matches every future task clone.
     VBoxManage createvm --name "$prepared_vm" --ostype Ubuntu_64 --register \
         || die "VBoxManage createvm failed"
     VBoxManage modifyvm "$prepared_vm" \
         --memory 2048 --cpus 2 \
         --nic1 nat \
-        --natpf1 "ssh,tcp,,$build_port,,22" \
+        --macaddress1 "$VBOX_CVM_MAC" \
         --boot1 disk --boot2 dvd \
         || die "VBoxManage modifyvm failed"
+
+    # Set SSH port forwarding via XML patch (VBoxManage 7.2 --natpf1 bug workaround)
+    vbox_set_nat_forwarding "$prepared_vm" "$build_port"
 
     # Add storage controllers
     VBoxManage storagectl "$prepared_vm" --name "SATA" --add sata --controller IntelAhci
@@ -794,8 +837,13 @@ vbox_ensure_image() {
         ubuntu@localhost "sudo shutdown -h now" &>/dev/null || true
     sleep 8  # wait for VirtualBox to complete shutdown
 
-    # Remove port forwarding rule before taking snapshot (task VMs add their own)
-    VBoxManage modifyvm "$prepared_vm" --natpf1 delete "ssh" &>/dev/null || true
+    # Remove port forwarding from .vbox before snapshot; task clones add their own.
+    # Converts <NAT(attrs)><Forwarding.../></NAT> back to self-closing <NAT(attrs)/>.
+    local vbox_file
+    vbox_file="$(VBoxManage showvminfo "$prepared_vm" --machinereadable 2>/dev/null \
+        | grep '^CfgFile=' | cut -d'"' -f2)"
+    sed -E -i "s|<NAT([^>]*)><Forwarding[^/]*/></NAT>|<NAT\1/>|g" "$vbox_file"
+    vbox_reload_config "$prepared_vm"
 
     # Detach seed ISO
     VBoxManage storageattach "$prepared_vm" \
@@ -826,9 +874,11 @@ vbox_run_claude() {
         --options link \
         || die "VBoxManage clonevm failed"
 
-    VBoxManage modifyvm "$VM_NAME" \
-        --natpf1 "ssh,tcp,,$VM_PORT,,22" \
-        || die "VBoxManage modifyvm (port forward) failed"
+    # Set fixed MAC (must match prepared VM so cloud-init's netplan config applies)
+    # and patch port forwarding via XML (VBoxManage 7.2 --natpf1 bug workaround)
+    VBoxManage modifyvm "$VM_NAME" --macaddress1 "$VBOX_CVM_MAC" \
+        || die "VBoxManage modifyvm (macaddress) failed"
+    vbox_set_nat_forwarding "$VM_NAME" "$VM_PORT"
 
     VBoxManage startvm "$VM_NAME" --type headless \
         || die "VBoxManage startvm failed"
