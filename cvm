@@ -720,16 +720,42 @@ vbox_set_nat_forwarding() {
     # VBoxManage 7.2.x has a bug where --natpf1 on a linked clone writes
     # hostport=0 to the .vbox XML.  Work around it by patching the XML directly,
     # then forcing VBoxSVC to reload the config via unregister+re-register.
+    #
+    # Uses Python (not sed) because the NAT section spans multiple lines in the
+    # .vbox XML, so single-line sed patterns cannot match it reliably.
+    # Handles two cases:
+    #   1. <Forwarding name="ssh" .../> already present → update hostport in-place
+    #   2. <NAT .../> is self-closing (no Forwarding) → expand with new Forwarding
     local vm_name="$1" port="$2"
     local vbox_file
     vbox_file="$(VBoxManage showvminfo "$vm_name" --machinereadable 2>/dev/null \
         | grep '^CfgFile=' | cut -d'"' -f2)"
     [[ -z "$vbox_file" ]] && die "Could not locate .vbox file for VM: $vm_name"
 
-    # Replace any self-closing <NAT.../> with <NAT...><Forwarding.../></NAT>.
-    # Uses -E extended regex so [^>]* captures any attributes (e.g. localhost-reachable).
-    sed -E -i "s|<NAT([^>]*)/>|<NAT\1><Forwarding name=\"ssh\" proto=\"1\" hostport=\"${port}\" guestport=\"22\"/></NAT>|g" \
-        "$vbox_file"
+    local pyfile
+    pyfile="$(mktemp /tmp/cvm-vboxpatch-XXXXXX.py)"
+    cat > "$pyfile" << 'PYEOF'
+import sys, re
+vbox_file, port = sys.argv[1], sys.argv[2]
+forwarding = '<Forwarding name="ssh" proto="1" hostport="{}" guestport="22"/>'.format(port)
+with open(vbox_file, 'r') as f:
+    content = f.read()
+if re.search(r'<Forwarding\s+name="ssh"', content):
+    # Case 1: update existing ssh Forwarding element
+    content = re.sub(r'<Forwarding\s+name="ssh"[^/]*/>', forwarding, content)
+else:
+    # Case 2: expand self-closing <NAT attrs/> to include Forwarding
+    content = re.sub(
+        r'(<NAT\b[^>]*)/>',
+        lambda m: '{}>  {}\n            </NAT>'.format(m.group(1), forwarding),
+        content)
+with open(vbox_file, 'w') as f:
+    f.write(content)
+PYEOF
+    python3 "$pyfile" "$vbox_file" "$port"
+    local rc=$?
+    rm -f "$pyfile"
+    [[ $rc -eq 0 ]] || die "Python XML patch failed for: $vm_name"
 
     grep -q "hostport=\"${port}\"" "$vbox_file" \
         || die "Failed to patch NAT port forwarding in $vbox_file"
@@ -838,11 +864,28 @@ vbox_ensure_image() {
     sleep 8  # wait for VirtualBox to complete shutdown
 
     # Remove port forwarding from .vbox before snapshot; task clones add their own.
-    # Converts <NAT(attrs)><Forwarding.../></NAT> back to self-closing <NAT(attrs)/>.
+    # Uses Python (not sed) because the NAT+Forwarding section spans multiple lines.
     local vbox_file
     vbox_file="$(VBoxManage showvminfo "$prepared_vm" --machinereadable 2>/dev/null \
         | grep '^CfgFile=' | cut -d'"' -f2)"
-    sed -E -i "s|<NAT([^>]*)><Forwarding[^/]*/></NAT>|<NAT\1/>|g" "$vbox_file"
+    local pyfile
+    pyfile="$(mktemp /tmp/cvm-vboxpatch-XXXXXX.py)"
+    cat > "$pyfile" << 'PYEOF'
+import sys, re
+vbox_file = sys.argv[1]
+with open(vbox_file, 'r') as f:
+    content = f.read()
+# Remove all Forwarding elements inside NAT
+content = re.sub(r'\s*<Forwarding[^/]*/>', '', content)
+# Collapse empty <NAT attrs></NAT> back to self-closing <NAT attrs/>
+content = re.sub(r'<NAT([^>]*)>\s*</NAT>', r'<NAT\1/>', content)
+with open(vbox_file, 'w') as f:
+    f.write(content)
+PYEOF
+    python3 "$pyfile" "$vbox_file"
+    local rc=$?
+    rm -f "$pyfile"
+    [[ $rc -eq 0 ]] || die "Python XML patch (clear forwarding) failed"
     vbox_reload_config "$prepared_vm"
 
     # Detach seed ISO
@@ -874,14 +917,18 @@ vbox_run_claude() {
         --options link \
         || die "VBoxManage clonevm failed"
 
-    # Set fixed MAC (must match prepared VM so cloud-init's netplan config applies)
-    # and patch port forwarding via XML (VBoxManage 7.2 --natpf1 bug workaround)
+    # Set fixed MAC so cloud-init's netplan config (which is MAC-specific) applies.
     VBoxManage modifyvm "$VM_NAME" --macaddress1 "$VBOX_CVM_MAC" \
         || die "VBoxManage modifyvm (macaddress) failed"
-    vbox_set_nat_forwarding "$VM_NAME" "$VM_PORT"
 
     VBoxManage startvm "$VM_NAME" --type headless \
         || die "VBoxManage startvm failed"
+
+    # Add SSH port forwarding via controlvm (not modifyvm) to avoid VBoxManage 7.2.x
+    # bug where --natpf1 on an offline linked clone writes hostport=0 to the .vbox
+    # XML.  controlvm natpf1 operates on the running hypervisor and is not affected.
+    VBoxManage controlvm "$VM_NAME" natpf1 "ssh,tcp,,${VM_PORT},,22" \
+        || die "VBoxManage controlvm natpf1 failed"
 
     vm_wait_for_ssh localhost "$VM_PORT"
     vm_setup_claude_auth localhost "$VM_PORT"
