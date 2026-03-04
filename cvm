@@ -26,6 +26,11 @@ VM_TASK_DIR=""      # VMware task directory path
 VM_PORT=""          # SSH port for VM backends
 VMWARE_PROVIDER=""  # ws, fusion, or player
 
+# ── Named VM config ────────────────────────────────────────────────────────────
+CVM_CONFIG_DIR="$HOME/.config/cvm"
+CVM_VMS_DIR="$CVM_CONFIG_DIR/vms"
+CVM_REGISTRY="$CVM_CONFIG_DIR/vms.json"
+
 # ── Colors ────────────────────────────────────────────────────────────────────
 # Initialize with color codes by default; setup_colors() clears them if needed
 RED=$'\033[0;31m'
@@ -48,6 +53,157 @@ success() { echo -e "${GREEN}[cvm]${RESET} $*"; }
 warn()    { echo -e "${YELLOW}[cvm]${RESET} $*" >&2; }
 error()   { echo -e "${RED}[cvm] error:${RESET} $*" >&2; }
 die()     { error "$*"; exit 1; }
+
+# ── Named VM Registry ─────────────────────────────────────────────────────────
+registry_ensure() {
+    mkdir -p "$CVM_VMS_DIR"
+    if [[ ! -f "$CVM_REGISTRY" ]]; then
+        echo '{}' > "$CVM_REGISTRY"
+    fi
+}
+
+registry_get_field() {
+    local name="$1" field="$2"
+    python3 - "$CVM_REGISTRY" "$name" "$field" <<'PYEOF'
+import json, sys
+reg_file, name, field = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(reg_file) as f:
+        data = json.load(f)
+    vm = data.get(name)
+    if vm is None:
+        sys.exit(1)
+    v = vm.get(field)
+    if v is not None:
+        print(v)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+registry_set() {
+    local name="$1" json_blob="$2"
+    python3 - "$CVM_REGISTRY" "$name" "$json_blob" <<'PYEOF'
+import json, sys
+reg_file, name, blob_str = sys.argv[1], sys.argv[2], sys.argv[3]
+blob = json.loads(blob_str)
+try:
+    with open(reg_file) as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data[name] = blob
+with open(reg_file, 'w') as f:
+    json.dump(data, f, indent=2)
+PYEOF
+}
+
+registry_delete() {
+    local name="$1"
+    python3 - "$CVM_REGISTRY" "$name" <<'PYEOF'
+import json, sys
+reg_file, name = sys.argv[1], sys.argv[2]
+try:
+    with open(reg_file) as f:
+        data = json.load(f)
+    data.pop(name, None)
+    with open(reg_file, 'w') as f:
+        json.dump(data, f, indent=2)
+except Exception:
+    pass
+PYEOF
+}
+
+registry_list_all() {
+    python3 - "$CVM_REGISTRY" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    print(json.dumps(list(data.values()), indent=2))
+except Exception:
+    print('[]')
+PYEOF
+}
+
+registry_exists() {
+    local name="$1"
+    python3 - "$CVM_REGISTRY" "$name" <<'PYEOF'
+import json, sys
+reg_file, name = sys.argv[1], sys.argv[2]
+try:
+    with open(reg_file) as f:
+        data = json.load(f)
+    sys.exit(0 if name in data else 1)
+except Exception:
+    sys.exit(1)
+PYEOF
+}
+
+# ── VM State Helpers ──────────────────────────────────────────────────────────
+vm_is_running() {
+    local name="$1" backend="$2"
+    case "$backend" in
+        kvm)
+            local pid_file="/tmp/cvm-${name}.pid"
+            if [[ -f "$pid_file" ]]; then
+                local pid
+                pid="$(cat "$pid_file" 2>/dev/null)"
+                if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+                    return 0
+                fi
+                # Stale PID file
+                rm -f "$pid_file" "/tmp/cvm-${name}.port"
+            fi
+            return 1
+            ;;
+        virtualbox)
+            local vbox_name="cvm-${name}"
+            local state
+            state="$(VBoxManage showvminfo "$vbox_name" --machinereadable 2>/dev/null \
+                | grep '^VMState=' | cut -d'"' -f2 || true)"
+            [[ "$state" == "running" ]]
+            ;;
+        docker)
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+vm_get_port() {
+    local name="$1"
+    local port_file="/tmp/cvm-${name}.port"
+    if [[ -f "$port_file" ]]; then
+        cat "$port_file"
+    fi
+}
+
+vm_named_start() {
+    local name="$1"
+    local backend
+    backend="$(registry_get_field "$name" backend)"
+    case "$backend" in
+        kvm)        kvm_vm_start "$name" ;;
+        virtualbox) vbox_vm_start "$name" ;;
+        docker)     return 0 ;;
+        *) die "Unknown backend: $backend" ;;
+    esac
+}
+
+vm_named_stop() {
+    local name="$1"
+    local backend
+    backend="$(registry_get_field "$name" backend)"
+    case "$backend" in
+        kvm)        kvm_vm_stop "$name" ;;
+        virtualbox) vbox_vm_stop "$name" ;;
+        docker)     return 0 ;;
+        *) die "Unknown backend: $backend" ;;
+    esac
+}
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 show_help() {
@@ -79,6 +235,29 @@ ${BOLD}EXAMPLES${RESET}
     cvm --out ./results --budget 2.00 "analyze this dataset and generate charts"
     cvm --backend kvm "write hello.txt with content 'hi'"
     echo "fix all TypeScript errors" | cvm --dir .
+
+${BOLD}NAMED VM SUBCOMMANDS${RESET}
+    cvm spinup [--name NAME] [--backend BACKEND]
+                                Provision a named persistent VM (stopped after creation)
+    cvm list                    List all named VMs with status
+    cvm start <name>            Start a stopped named VM
+    cvm stop <name>             Stop a running named VM
+    cvm run <name> [OPTIONS] "task"
+                                Run a Claude task in a named VM
+    cvm rename <name> <new>     Rename a named VM
+    cvm move <name> <dest>      Move VM disk/workspace to a new directory
+    cvm delete <name>           Delete a named VM and its files
+    cvm status <name>           Show detailed status of a named VM
+
+${BOLD}NAMED VM EXAMPLES${RESET}
+    cvm spinup --name dev --backend docker
+    cvm run dev "write a hello world server in Go"
+    cvm run dev --dir ./src --out ./results "refactor all Go files"
+    cvm list
+    cvm status dev
+    cvm stop dev
+    cvm rename dev dev2
+    cvm delete dev2
 
 ${BOLD}AUTH${RESET}
     OAuth:   Run 'claude auth login' on the host (~/.claude/.credentials.json)
@@ -1156,6 +1335,339 @@ vmware_run_claude() {
     return $exit_code
 }
 
+# ── KVM Named VM operations ───────────────────────────────────────────────────
+kvm_vm_create() {
+    local name="$1"
+    local vm_dir="$CVM_VMS_DIR/$name"
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_img="$vm_cache_dir/images/kvm-prepared-${install_hash}.qcow2"
+
+    mkdir -p "$vm_dir/workspace"
+
+    info "Creating KVM persistent disk for VM '$name'..."
+    qemu-img create -f qcow2 -b "$prepared_img" -F qcow2 "$vm_dir/disk.qcow2" \
+        &>/dev/null || die "qemu-img create (named VM disk) failed"
+
+    success "KVM VM '$name' created: $vm_dir"
+}
+
+kvm_vm_start() {
+    local name="$1"
+    local disk
+    disk="$(registry_get_field "$name" disk)"
+    [[ -f "$disk" ]] || die "KVM disk not found: $disk"
+
+    local port
+    port="$(vm_random_port)"
+
+    info "Starting KVM VM '$name' (SSH port $port)..."
+    qemu-system-x86_64 \
+        -enable-kvm \
+        -m 2048 \
+        -smp 2 \
+        -nographic \
+        -serial none \
+        -monitor none \
+        -drive "file=$disk,format=qcow2" \
+        -netdev "user,id=net0,hostfwd=tcp::${port}-:22" \
+        -device virtio-net-pci,netdev=net0 \
+        &>/dev/null &
+    local pid=$!
+    echo "$pid"  > "/tmp/cvm-${name}.pid"
+    echo "$port" > "/tmp/cvm-${name}.port"
+
+    vm_wait_for_ssh localhost "$port" || {
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        rm -f "/tmp/cvm-${name}.pid" "/tmp/cvm-${name}.port"
+        die "SSH timeout starting KVM VM '$name'"
+    }
+    success "KVM VM '$name' started (PID $pid, port $port)"
+}
+
+kvm_vm_stop() {
+    local name="$1"
+    local pid_file="/tmp/cvm-${name}.pid"
+    local port_file="/tmp/cvm-${name}.port"
+
+    if [[ ! -f "$pid_file" ]]; then
+        warn "No PID file found for KVM VM '$name' — may already be stopped"
+        return 0
+    fi
+
+    local port
+    port="$(cat "$port_file" 2>/dev/null || echo "")"
+
+    info "Shutting down KVM VM '$name'..."
+    if [[ -n "$port" ]]; then
+        ssh \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=5 \
+            -i "$vm_cache_dir/ssh/id_rsa" \
+            -p "$port" \
+            ubuntu@localhost "sudo shutdown -h now" &>/dev/null || true
+    fi
+
+    local pid
+    pid="$(cat "$pid_file" 2>/dev/null || echo "")"
+    if [[ -n "$pid" ]]; then
+        local timeout=60 elapsed=0
+        while [[ $elapsed -lt $timeout ]]; do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 2
+            elapsed=$((elapsed + 2))
+        done
+        kill "$pid" 2>/dev/null || true
+    fi
+
+    rm -f "$pid_file" "$port_file"
+    success "KVM VM '$name' stopped"
+}
+
+kvm_vm_delete() {
+    local name="$1"
+    local disk workspace
+    disk="$(registry_get_field "$name" disk 2>/dev/null || echo "")"
+    workspace="$(registry_get_field "$name" workspace 2>/dev/null || echo "")"
+
+    if vm_is_running "$name" kvm; then
+        kvm_vm_stop "$name"
+    fi
+
+    [[ -n "$disk" ]] && rm -f "$disk"
+    if [[ -n "$workspace" ]]; then
+        rm -rf "$(dirname "$workspace")"
+    fi
+}
+
+kvm_vm_rename() {
+    local name="$1" new_name="$2"
+    if vm_is_running "$name" kvm; then
+        die "Cannot rename running KVM VM '$name'. Stop it first with: cvm stop $name"
+    fi
+    mv "$CVM_VMS_DIR/$name" "$CVM_VMS_DIR/$new_name"
+}
+
+kvm_vm_move() {
+    local name="$1" dest="$2"
+    if vm_is_running "$name" kvm; then
+        die "Cannot move running KVM VM '$name'. Stop it first with: cvm stop $name"
+    fi
+    mkdir -p "$dest"
+    mv "$CVM_VMS_DIR/$name" "$dest/$name"
+}
+
+# ── VirtualBox Named VM operations ────────────────────────────────────────────
+vbox_vm_create() {
+    local name="$1"
+    local vbox_name="cvm-${name}"
+    local install_hash
+    install_hash="$(vm_get_install_hash)"
+    local prepared_vm="cvm-prepared-${install_hash}"
+    local vm_dir="$CVM_VMS_DIR/$name"
+
+    mkdir -p "$vm_dir/workspace"
+
+    info "Creating VirtualBox linked clone for VM '$name'..."
+    VBoxManage clonevm "$prepared_vm" \
+        --snapshot ready \
+        --name "$vbox_name" \
+        --register \
+        --options link \
+        || die "VBoxManage clonevm failed for '$name'"
+
+    VBoxManage modifyvm "$vbox_name" --macaddress1 "$VBOX_CVM_MAC" \
+        || die "VBoxManage modifyvm (macaddress) failed for '$name'"
+
+    success "VirtualBox VM '$name' created (VBox name: $vbox_name)"
+}
+
+vbox_vm_start() {
+    local name="$1"
+    local vbox_name="cvm-${name}"
+    local port
+    port="$(vm_random_port)"
+
+    info "Starting VirtualBox VM '$name' (SSH port $port)..."
+    VBoxManage startvm "$vbox_name" --type headless \
+        || die "VBoxManage startvm failed for '$name'"
+
+    VBoxManage controlvm "$vbox_name" natpf1 "ssh,tcp,,${port},,22" \
+        || die "VBoxManage controlvm natpf1 failed for '$name'"
+
+    echo "$port" > "/tmp/cvm-${name}.port"
+
+    vm_wait_for_ssh localhost "$port" || {
+        VBoxManage controlvm "$vbox_name" poweroff &>/dev/null || true
+        rm -f "/tmp/cvm-${name}.port"
+        die "SSH timeout starting VirtualBox VM '$name'"
+    }
+    success "VirtualBox VM '$name' started (port $port)"
+}
+
+vbox_vm_stop() {
+    local name="$1"
+    local vbox_name="cvm-${name}"
+    local port_file="/tmp/cvm-${name}.port"
+    local port
+    port="$(cat "$port_file" 2>/dev/null || echo "")"
+
+    info "Shutting down VirtualBox VM '$name'..."
+    if [[ -n "$port" ]]; then
+        ssh \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            -o BatchMode=yes -o ConnectTimeout=5 \
+            -i "$vm_cache_dir/ssh/id_rsa" \
+            -p "$port" \
+            ubuntu@localhost "sudo shutdown -h now" &>/dev/null || true
+    else
+        VBoxManage controlvm "$vbox_name" acpipowerbutton &>/dev/null || true
+    fi
+
+    local timeout=60 elapsed=0
+    while [[ $elapsed -lt $timeout ]]; do
+        local state
+        state="$(VBoxManage showvminfo "$vbox_name" --machinereadable 2>/dev/null \
+            | grep '^VMState=' | cut -d'"' -f2 || true)"
+        if [[ "$state" == "poweroff" ]] || [[ "$state" == "aborted" ]]; then
+            break
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    rm -f "$port_file"
+    success "VirtualBox VM '$name' stopped"
+}
+
+vbox_vm_delete() {
+    local name="$1"
+    local vbox_name="cvm-${name}"
+    local workspace
+    workspace="$(registry_get_field "$name" workspace 2>/dev/null || echo "")"
+
+    if vm_is_running "$name" virtualbox; then
+        VBoxManage controlvm "$vbox_name" poweroff &>/dev/null || true
+        sleep 2
+    fi
+    rm -f "/tmp/cvm-${name}.port"
+
+    if VBoxManage showvminfo "$vbox_name" &>/dev/null 2>&1; then
+        VBoxManage unregistervm "$vbox_name" --delete &>/dev/null \
+            || die "VBoxManage unregistervm failed for '$name'"
+    fi
+
+    if [[ -n "$workspace" ]]; then
+        rm -rf "$(dirname "$workspace")"
+    fi
+}
+
+vbox_vm_rename() {
+    local name="$1" new_name="$2"
+    local vbox_name="cvm-${name}"
+    local new_vbox_name="cvm-${new_name}"
+
+    if vm_is_running "$name" virtualbox; then
+        die "Cannot rename running VirtualBox VM '$name'. Stop it first with: cvm stop $name"
+    fi
+
+    VBoxManage modifyvm "$vbox_name" --name "$new_vbox_name" \
+        || die "VBoxManage modifyvm --name failed"
+    mv "$CVM_VMS_DIR/$name" "$CVM_VMS_DIR/$new_name"
+}
+
+vbox_vm_move() {
+    local name="$1" dest="$2"
+    if vm_is_running "$name" virtualbox; then
+        die "Cannot move running VirtualBox VM '$name'. Stop it first with: cvm stop $name"
+    fi
+    local vbox_name="cvm-${name}"
+    mkdir -p "$dest"
+    VBoxManage movevm "$vbox_name" --folder "$dest" &>/dev/null \
+        || die "VBoxManage movevm failed for '$name'"
+}
+
+# ── Docker Named VM operations ────────────────────────────────────────────────
+docker_vm_create() {
+    local name="$1"
+    local vm_dir="$CVM_VMS_DIR/$name"
+    mkdir -p "$vm_dir/workspace"
+    chmod 777 "$vm_dir/workspace"
+    success "Docker VM '$name' created: $vm_dir"
+}
+
+docker_vm_run_claude() {
+    local name="$1"
+    local workspace
+    workspace="$(registry_get_field "$name" workspace)"
+    local image_tag="cvm:${IMAGE_HASH}"
+
+    local claude_tmp
+    claude_tmp="$(mktemp -d /tmp/cvm-claude-XXXXXX)"
+    chmod 777 "$claude_tmp"
+    if [[ -f "$HOME/.claude/.credentials.json" ]]; then
+        cp "$HOME/.claude/.credentials.json" "$claude_tmp/.credentials.json"
+    fi
+    if [[ -f "$HOME/.claude/settings.json" ]]; then
+        cp "$HOME/.claude/settings.json" "$claude_tmp/settings.json"
+    fi
+
+    local docker_args=(
+        run --rm
+        --name "cvm-named-${name}-$$"
+        -v "${workspace}:/workspace"
+        -v "$claude_tmp:/home/ubuntu/.claude"
+        -e "TERM=xterm-256color"
+        -e "HOME=/home/ubuntu"
+        -w /workspace
+        --network bridge
+    )
+    if [[ -f "$HOME/.claude.json" ]]; then
+        docker_args+=(-v "$HOME/.claude.json:/home/ubuntu/.claude.json:ro")
+    fi
+    if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+        docker_args+=(-e "ANTHROPIC_API_KEY")
+    fi
+    docker_args+=("$image_tag")
+
+    local claude_args=(
+        claude --dangerously-skip-permissions --no-session-persistence
+        -p "$TASK" --model "$MODEL"
+    )
+    [[ -n "$BUDGET" ]] && claude_args+=(--max-budget-usd "$BUDGET")
+    [[ "$VERBOSE" == "true" ]] && claude_args+=(--output-format stream-json --verbose)
+
+    local exit_code=0
+    if [[ "$VERBOSE" == "true" ]]; then
+        write_stream_json_parser
+        docker "${docker_args[@]}" "${claude_args[@]}" | parse_stream_json
+        exit_code=${PIPESTATUS[0]}
+    else
+        docker "${docker_args[@]}" "${claude_args[@]}"
+        exit_code=$?
+    fi
+
+    rm -rf "$claude_tmp"
+    return $exit_code
+}
+
+docker_vm_delete() {
+    local name="$1"
+    rm -rf "$CVM_VMS_DIR/$name"
+}
+
+docker_vm_rename() {
+    local name="$1" new_name="$2"
+    mv "$CVM_VMS_DIR/$name" "$CVM_VMS_DIR/$new_name"
+}
+
+docker_vm_move() {
+    local name="$1" dest="$2"
+    mkdir -p "$dest"
+    mv "$CVM_VMS_DIR/$name" "$dest/$name"
+}
+
 # ── Image preparation dispatcher ──────────────────────────────────────────────
 ensure_image() {
     case "$BACKEND" in
@@ -1197,6 +1709,415 @@ create_workspace() {
             cp "$HOME/.claude/settings.json" "$CLAUDE_TMP/settings.json"
         fi
     fi
+}
+
+# ── Subcommand implementations ────────────────────────────────────────────────
+
+validate_vm_name() {
+    local name="$1"
+    [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] \
+        || die "Invalid VM name '$name'. Use only letters, digits, hyphens, underscores (must start with letter/digit)."
+}
+
+# cvm spinup [--name NAME] [--backend BACKEND]
+cmd_spinup() {
+    local name="" spinup_backend=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)    [[ $# -lt 2 ]] && die "--name requires an argument"; name="$2"; shift 2 ;;
+            --backend) [[ $# -lt 2 ]] && die "--backend requires an argument"; spinup_backend="$2"; shift 2 ;;
+            -h|--help) show_help; exit 0 ;;
+            *) die "Unknown option for spinup: $1" ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        name="vm-$(date +%s)"
+    fi
+    validate_vm_name "$name"
+
+    if [[ -n "$spinup_backend" ]]; then
+        BACKEND="$spinup_backend"
+    fi
+
+    setup_colors
+    registry_ensure
+
+    if registry_exists "$name"; then
+        die "VM '$name' already exists. Use 'cvm list' to see all VMs."
+    fi
+
+    detect_backend
+    case "$BACKEND" in
+        docker|kvm|virtualbox) ;;
+        vmware) die "VMware does not support named VMs. Use docker, kvm, or virtualbox." ;;
+        *) die "Unknown backend: $BACKEND" ;;
+    esac
+
+    check_deps
+    check_auth
+    info "Provisioning VM '$name' (backend: $BACKEND)..."
+    ensure_image
+
+    local created_at
+    created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    local vm_dir="$CVM_VMS_DIR/$name"
+
+    case "$BACKEND" in
+        kvm)
+            kvm_vm_create "$name"
+            registry_set "$name" \
+                "{\"name\":\"$name\",\"backend\":\"kvm\",\"created\":\"$created_at\",\"disk\":\"$vm_dir/disk.qcow2\",\"workspace\":\"$vm_dir/workspace\"}"
+            ;;
+        virtualbox)
+            vbox_vm_create "$name"
+            registry_set "$name" \
+                "{\"name\":\"$name\",\"backend\":\"virtualbox\",\"created\":\"$created_at\",\"vbox_name\":\"cvm-$name\",\"workspace\":\"$vm_dir/workspace\"}"
+            ;;
+        docker)
+            docker_vm_create "$name"
+            registry_set "$name" \
+                "{\"name\":\"$name\",\"backend\":\"docker\",\"created\":\"$created_at\",\"workspace\":\"$vm_dir/workspace\"}"
+            ;;
+    esac
+
+    success "VM '$name' ready. Run tasks with: cvm run $name \"your task\""
+}
+
+# cvm list
+cmd_list() {
+    setup_colors
+    registry_ensure
+
+    local vm_list
+    mapfile -t vm_list < <(python3 - "$CVM_REGISTRY" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        data = json.load(f)
+    for vm in data.values():
+        name     = vm.get('name', '')
+        backend  = vm.get('backend', '')
+        created  = vm.get('created', '')[:10]
+        location = vm.get('workspace', vm.get('disk', ''))
+        print(f"{name}\t{backend}\t{created}\t{location}")
+except Exception:
+    pass
+PYEOF
+    )
+
+    if [[ ${#vm_list[@]} -eq 0 ]]; then
+        info "No named VMs found. Create one with: cvm spinup --name myvm"
+        return 0
+    fi
+
+    printf "${BOLD}%-20s %-12s %-12s %-11s %s${RESET}\n" \
+        "NAME" "BACKEND" "STATUS" "CREATED" "LOCATION"
+
+    for entry in "${vm_list[@]}"; do
+        IFS=$'\t' read -r name backend created location <<< "$entry"
+        local status="stopped"
+        case "$backend" in
+            kvm)        vm_is_running "$name" kvm        && status="running" || true ;;
+            virtualbox) vm_is_running "$name" virtualbox && status="running" || true ;;
+            docker)     status="ready" ;;
+        esac
+        local status_color="$DIM"
+        [[ "$status" == "running" ]] && status_color="$GREEN"
+        [[ "$status" == "ready"   ]] && status_color="$CYAN"
+        printf "%-20s %-12s ${status_color}%-12s${RESET} %-11s %s\n" \
+            "$name" "$backend" "$status" "$created" "$location"
+    done
+}
+
+# cvm status <name>
+cmd_status() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: cvm status <name>"
+    setup_colors
+    registry_ensure
+    registry_exists "$name" || die "VM '$name' not found. Use 'cvm list' to see all VMs."
+
+    local backend created workspace disk vbox_name
+    backend="$(registry_get_field   "$name" backend)"
+    created="$(registry_get_field   "$name" created  2>/dev/null || echo "")"
+    workspace="$(registry_get_field "$name" workspace 2>/dev/null || echo "")"
+    disk="$(registry_get_field      "$name" disk      2>/dev/null || echo "")"
+    vbox_name="$(registry_get_field "$name" vbox_name 2>/dev/null || echo "")"
+
+    local status="stopped"
+    case "$backend" in
+        kvm)        vm_is_running "$name" kvm        && status="running" || true ;;
+        virtualbox) vm_is_running "$name" virtualbox && status="running" || true ;;
+        docker)     status="ready" ;;
+    esac
+
+    echo ""
+    echo "${BOLD}VM: $name${RESET}"
+    echo "  Backend:   $backend"
+    echo "  Status:    $status"
+    echo "  Created:   $created"
+    [[ -n "$workspace"  ]] && echo "  Workspace: $workspace"
+    [[ -n "$disk"       ]] && echo "  Disk:      $disk"
+    [[ -n "$vbox_name"  ]] && echo "  VBox name: $vbox_name"
+    if [[ "$status" == "running" ]]; then
+        local port
+        port="$(vm_get_port "$name")"
+        [[ -n "$port" ]] && echo "  SSH port:  $port"
+    fi
+    echo ""
+}
+
+# cvm start <name>
+cmd_start() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: cvm start <name>"
+    setup_colors
+    registry_ensure
+    registry_exists "$name" || die "VM '$name' not found."
+
+    local backend
+    backend="$(registry_get_field "$name" backend)"
+
+    if [[ "$backend" == "docker" ]]; then
+        info "Docker VMs don't require explicit start (containers are ephemeral per task)."
+        return 0
+    fi
+
+    if vm_is_running "$name" "$backend"; then
+        info "VM '$name' is already running."
+        return 0
+    fi
+
+    check_deps
+    vm_named_start "$name"
+}
+
+# cvm stop <name>
+cmd_stop() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: cvm stop <name>"
+    setup_colors
+    registry_ensure
+    registry_exists "$name" || die "VM '$name' not found."
+
+    local backend
+    backend="$(registry_get_field "$name" backend)"
+
+    if [[ "$backend" == "docker" ]]; then
+        info "Docker VMs don't require explicit stop (containers are ephemeral per task)."
+        return 0
+    fi
+
+    if ! vm_is_running "$name" "$backend"; then
+        info "VM '$name' is not running."
+        return 0
+    fi
+
+    vm_named_stop "$name"
+}
+
+# cvm run <name> [--dir D] [--out O] [--model M] [--budget B] [-v] "task"
+cmd_run() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: cvm run <name> [OPTIONS] \"task\""
+    shift
+
+    setup_colors
+    registry_ensure
+    registry_exists "$name" || die "VM '$name' not found. Use 'cvm spinup' to create one."
+
+    local backend workspace
+    backend="$(registry_get_field   "$name" backend)"
+    workspace="$(registry_get_field "$name" workspace)"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -d|--dir)     [[ $# -lt 2 ]] && die "--dir requires an argument";    DIR="$2";    shift 2 ;;
+            -o|--out)     [[ $# -lt 2 ]] && die "--out requires an argument";    OUT="$2";    shift 2 ;;
+            -m|--model)   [[ $# -lt 2 ]] && die "--model requires an argument";  MODEL="$2";  shift 2 ;;
+            -b|--budget)  [[ $# -lt 2 ]] && die "--budget requires an argument"; BUDGET="$2"; shift 2 ;;
+            -v|--verbose) VERBOSE=true; shift ;;
+            --) shift; TASK="${*}"; break ;;
+            -*) die "Unknown option: $1" ;;
+            *)  TASK="${*}"; break ;;
+        esac
+    done
+
+    if [[ -z "$TASK" ]] && [[ ! -t 0 ]]; then
+        TASK="$(cat)"
+    fi
+    [[ -z "$TASK" ]] && die "No task provided."
+
+    WORKSPACE="$workspace"
+
+    if [[ -n "$DIR" ]]; then
+        [[ -d "$DIR" ]] || die "Directory not found: $DIR"
+        cp -r "$DIR/." "$WORKSPACE/"
+        chmod -R a+rw "$WORKSPACE"
+    fi
+
+    check_auth
+
+    local exit_code=0
+
+    case "$backend" in
+        kvm|virtualbox)
+            check_deps
+            if ! vm_is_running "$name" "$backend"; then
+                info "Auto-starting VM '$name'..."
+                vm_named_start "$name"
+            fi
+            local port
+            port="$(vm_get_port "$name")"
+            [[ -z "$port" ]] && die "Could not get SSH port for VM '$name'"
+
+            vm_setup_claude_auth localhost "$port"
+            vm_copy_workspace_in localhost "$port"
+
+            echo ""
+            info "Task: ${BOLD}${TASK}${RESET}"
+            info "Model: $MODEL"
+            [[ -n "$BUDGET" ]] && info "Budget: \$$BUDGET"
+            echo ""
+
+            vm_run_claude_ssh localhost "$port" || exit_code=$?
+            vm_copy_workspace_out localhost "$port"
+            ;;
+        docker)
+            BACKEND="docker"
+            check_deps
+            compute_image_hash
+            ensure_image
+
+            echo ""
+            info "Task: ${BOLD}${TASK}${RESET}"
+            info "Model: $MODEL"
+            [[ -n "$BUDGET" ]] && info "Budget: \$$BUDGET"
+            echo ""
+
+            docker_vm_run_claude "$name" || exit_code=$?
+            ;;
+        *)
+            die "Unknown backend: $backend"
+            ;;
+    esac
+
+    if [[ -n "$OUT" ]]; then
+        mkdir -p "$OUT"
+        cp -r "$WORKSPACE/." "$OUT/"
+        success "Results copied to: $OUT"
+    fi
+
+    show_file_summary
+
+    if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
+        warn "Claude exited with code $exit_code"
+    fi
+    return $exit_code
+}
+
+# cvm rename <name> <new-name>
+cmd_rename() {
+    local name="${1:-}" new_name="${2:-}"
+    [[ -z "$name" || -z "$new_name" ]] && die "Usage: cvm rename <name> <new-name>"
+    setup_colors
+    registry_ensure
+    registry_exists "$name" || die "VM '$name' not found."
+    validate_vm_name "$new_name"
+
+    if registry_exists "$new_name"; then
+        die "VM '$new_name' already exists."
+    fi
+
+    local backend
+    backend="$(registry_get_field "$name" backend)"
+
+    case "$backend" in
+        kvm)        kvm_vm_rename   "$name" "$new_name" ;;
+        virtualbox) vbox_vm_rename  "$name" "$new_name" ;;
+        docker)     docker_vm_rename "$name" "$new_name" ;;
+        *) die "Unknown backend: $backend" ;;
+    esac
+
+    python3 - "$CVM_REGISTRY" "$name" "$new_name" "$CVM_VMS_DIR" <<'PYEOF'
+import json, sys
+reg_file, name, new_name, vms_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(reg_file) as f:
+    data = json.load(f)
+vm = data.pop(name)
+vm['name'] = new_name
+for key in ('disk', 'workspace'):
+    if key in vm and vm[key]:
+        vm[key] = vm[key].replace(f'/{name}/', f'/{new_name}/', 1)
+if 'vbox_name' in vm:
+    vm['vbox_name'] = f'cvm-{new_name}'
+data[new_name] = vm
+with open(reg_file, 'w') as f:
+    json.dump(data, f, indent=2)
+PYEOF
+
+    success "VM '$name' renamed to '$new_name'"
+}
+
+# cvm move <name> <dest-path>
+cmd_move() {
+    local name="${1:-}" dest="${2:-}"
+    [[ -z "$name" || -z "$dest" ]] && die "Usage: cvm move <name> <dest-path>"
+    setup_colors
+    registry_ensure
+    registry_exists "$name" || die "VM '$name' not found."
+
+    local backend
+    backend="$(registry_get_field "$name" backend)"
+    dest="$(realpath -m "$dest")"
+
+    case "$backend" in
+        kvm)        kvm_vm_move    "$name" "$dest" ;;
+        virtualbox) vbox_vm_move   "$name" "$dest" ;;
+        docker)     docker_vm_move "$name" "$dest" ;;
+        *) die "Unknown backend: $backend" ;;
+    esac
+
+    python3 - "$CVM_REGISTRY" "$name" "$dest" <<'PYEOF'
+import json, sys, os
+reg_file, name, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(reg_file) as f:
+    data = json.load(f)
+vm = data[name]
+new_base = os.path.join(dest, name)
+for key in ('disk', 'workspace'):
+    if key in vm and vm[key]:
+        vm[key] = os.path.join(new_base, os.path.basename(vm[key]))
+with open(reg_file, 'w') as f:
+    json.dump(data, f, indent=2)
+PYEOF
+
+    success "VM '$name' moved to $dest/$name"
+}
+
+# cvm delete <name>
+cmd_delete() {
+    local name="${1:-}"
+    [[ -z "$name" ]] && die "Usage: cvm delete <name>"
+    setup_colors
+    registry_ensure
+    registry_exists "$name" || die "VM '$name' not found."
+
+    local backend
+    backend="$(registry_get_field "$name" backend)"
+
+    info "Deleting VM '$name' (backend: $backend)..."
+
+    case "$backend" in
+        kvm)        kvm_vm_delete    "$name" ;;
+        virtualbox) vbox_vm_delete   "$name" ;;
+        docker)     docker_vm_delete "$name" ;;
+        *) die "Unknown backend: $backend" ;;
+    esac
+
+    registry_delete "$name"
+    success "VM '$name' deleted"
 }
 
 # ── File summary ──────────────────────────────────────────────────────────────
@@ -1462,6 +2383,21 @@ run_claude() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
+    # Detect and dispatch named VM subcommands before one-shot flag parsing.
+    local subcommand="${1:-}"
+    case "$subcommand" in
+        spinup)   shift; cmd_spinup  "$@"; return ;;
+        list|ls)  shift; cmd_list    "$@"; return ;;
+        start)    shift; cmd_start   "$@"; return ;;
+        stop)     shift; cmd_stop    "$@"; return ;;
+        run)      shift; cmd_run     "$@"; return ;;
+        rename)   shift; cmd_rename  "$@"; return ;;
+        move)     shift; cmd_move    "$@"; return ;;
+        delete)   shift; cmd_delete  "$@"; return ;;
+        status)   shift; cmd_status  "$@"; return ;;
+    esac
+
+    # One-shot mode (original behavior, unchanged)
     parse_args "$@"
     setup_colors
     detect_backend
