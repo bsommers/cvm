@@ -1446,7 +1446,12 @@ kvm_vm_rename() {
     if vm_is_running "$name" kvm; then
         die "Cannot rename running KVM VM '$name'. Stop it first with: cvm stop $name"
     fi
-    mv "$CVM_VMS_DIR/$name" "$CVM_VMS_DIR/$new_name"
+    local workspace
+    workspace="$(registry_get_field "$name" workspace 2>/dev/null || echo "")"
+    local old_dir
+    old_dir="${workspace:+$(dirname "$workspace")}"
+    old_dir="${old_dir:-$CVM_VMS_DIR/$name}"
+    mv "$old_dir" "$(dirname "$old_dir")/$new_name"
 }
 
 kvm_vm_move() {
@@ -1574,7 +1579,12 @@ vbox_vm_rename() {
 
     VBoxManage modifyvm "$vbox_name" --name "$new_vbox_name" \
         || die "VBoxManage modifyvm --name failed"
-    mv "$CVM_VMS_DIR/$name" "$CVM_VMS_DIR/$new_name"
+    local workspace
+    workspace="$(registry_get_field "$name" workspace 2>/dev/null || echo "")"
+    local old_dir
+    old_dir="${workspace:+$(dirname "$workspace")}"
+    old_dir="${old_dir:-$CVM_VMS_DIR/$name}"
+    mv "$old_dir" "$(dirname "$old_dir")/$new_name"
 }
 
 vbox_vm_move() {
@@ -1654,12 +1664,23 @@ docker_vm_run_claude() {
 
 docker_vm_delete() {
     local name="$1"
-    rm -rf "$CVM_VMS_DIR/$name"
+    local workspace
+    workspace="$(registry_get_field "$name" workspace 2>/dev/null || echo "")"
+    if [[ -n "$workspace" ]]; then
+        rm -rf "$(dirname "$workspace")"
+    else
+        rm -rf "$CVM_VMS_DIR/$name"
+    fi
 }
 
 docker_vm_rename() {
     local name="$1" new_name="$2"
-    mv "$CVM_VMS_DIR/$name" "$CVM_VMS_DIR/$new_name"
+    local workspace
+    workspace="$(registry_get_field "$name" workspace 2>/dev/null || echo "")"
+    local old_dir
+    old_dir="${workspace:+$(dirname "$workspace")}"
+    old_dir="${old_dir:-$CVM_VMS_DIR/$name}"
+    mv "$old_dir" "$(dirname "$old_dir")/$new_name"
 }
 
 docker_vm_move() {
